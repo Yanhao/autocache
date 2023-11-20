@@ -24,3 +24,5 @@ futures = "0.3"
 im = "15"
 moka = { version =  "0.12", features = [ "sync" ] }
 derivative = "2"
+arc-swap = "1.6"
+tracing = "0.1"

@@ -2,6 +2,7 @@
 #![feature(async_closure)]
 #![feature(type_alias_impl_trait)]
 #![feature(associated_type_defaults)]
+#![feature(result_option_inspect)]
 
 pub mod autocache;
 pub mod builder;

@@ -18,8 +18,8 @@ impl<K, V, L1, L2> Cache for TwoLevelCache<K, V, L1, L2>
 where
     K: Ord + Sync + Send + AsRef<str> + Codec + Clone,
     V: Clone + Sync + Send + Codec + EntryTrait<K>,
-    L1: Cache<Key = K, Value = V>,
-    L2: Cache<Key = K, Value = V>,
+    L1: Cache<Key = K, Value = V> + Sync,
+    L2: Cache<Key = K, Value = V> + Sync,
 {
     type Key = K;
     type Value = V;

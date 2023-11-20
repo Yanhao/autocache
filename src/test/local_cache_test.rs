@@ -15,6 +15,7 @@ async fn test_builder() {
             ..Default::default()
         }))
         .expire_time(std::time::Duration::from_secs(10))
+        .use_expired_data(true)
         .single_loader(|key: String| {
             async move {
                 dbg!(&key);

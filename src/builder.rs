@@ -1,3 +1,6 @@
+use std::fmt::Debug;
+use std::sync::Arc;
+
 use anyhow::Result;
 use futures::future::BoxFuture;
 
@@ -5,7 +8,7 @@ use crate::{autocache::AutoCache, cache::Cache, codec::Codec, entry::Entry, load
 
 pub struct AutoCacheBuilder<K, V, C>
 where
-    K: Clone + std::cmp::PartialEq + AsRef<str> + Codec,
+    K: Clone + std::cmp::PartialEq + AsRef<str> + Codec + Send,
     V: Clone + Codec,
     C: Cache<Key = K, Value = Entry<K, V>>,
 {
@@ -25,9 +28,9 @@ where
 
 impl<K, V, C> AutoCacheBuilder<K, V, C>
 where
-    K: Clone + std::cmp::PartialEq + AsRef<str> + Codec,
-    V: Clone + Codec,
-    C: Cache<Key = K, Value = Entry<K, V>>,
+    K: Clone + std::cmp::PartialEq + AsRef<str> + Codec + Debug + Send + 'static + Sync,
+    V: Clone + Codec + Debug + Send + Sync + 'static,
+    C: Cache<Key = K, Value = Entry<K, V>> + Send + Sync + 'static,
 {
     pub fn new() -> Self {
         Self {
@@ -52,7 +55,7 @@ where
 
     pub fn single_loader(
         mut self,
-        l: impl Fn(K) -> BoxFuture<'static, Result<Option<V>>> + 'static,
+        l: impl Fn(K) -> BoxFuture<'static, Result<Option<V>>> + 'static + Send + Sync,
     ) -> Self {
         self.loader = Some(Loader::SingleLoader(Box::new(l)));
         self
@@ -60,7 +63,7 @@ where
 
     pub fn multi_loader(
         mut self,
-        l: impl Fn(&[K]) -> BoxFuture<'static, Result<Vec<(K, V)>>> + 'static,
+        l: impl Fn(&[K]) -> BoxFuture<'static, Result<Vec<(K, V)>>> + 'static + Send + Sync,
     ) -> Self {
         self.loader = Some(Loader::MultiLoader(Box::new(l)));
         self
@@ -107,9 +110,9 @@ where
     }
 
     pub fn build(self) -> AutoCache<K, V, C> {
-        AutoCache::<K, V, C> {
-            cache_store: self.cache.unwrap(),
-            loader: self.loader.unwrap(),
+        let mut ac = AutoCache::<K, V, C> {
+            cache_store: Arc::new(self.cache.unwrap()),
+            loader: Arc::new(self.loader.unwrap()),
             namespace: self.namespace,
             cache_none: self.cache_none,
             expire_time: self.expire_time,
@@ -119,8 +122,17 @@ where
             async_set_cache: self.async_set_cache,
             use_expired_data: self.use_expired_data,
 
-            sfg: async_singleflight::Group::new(),
-            mfg: async_singleflight::Group::new(),
+            sfg: Arc::new(async_singleflight::Group::new()),
+            mfg: Arc::new(async_singleflight::Group::new()),
+
+            input: None.into(),
+            stop_ch: None,
+        };
+
+        if ac.use_expired_data {
+            ac.start().unwrap();
         }
+
+        ac
     }
 }

@@ -1,7 +1,9 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 use anyhow::Result;
+use arc_swap::ArcSwapOption;
 use chrono::{prelude::*, Duration};
+use tracing::error;
 
 use crate::{
     builder::AutoCacheBuilder,
@@ -17,11 +19,11 @@ where
     V: Clone + Codec,
     C: Cache<Key = K, Value = Entry<K, V>>,
 {
-    pub(crate) cache_store: C,
-    pub(crate) loader: Loader<K, V>,
+    pub(crate) cache_store: Arc<C>,
+    pub(crate) loader: Arc<Loader<K, V>>,
 
-    pub(crate) sfg: async_singleflight::Group<Option<V>, anyhow::Error>,
-    pub(crate) mfg: async_singleflight::Group<Vec<(K, V)>, anyhow::Error>,
+    pub(crate) sfg: Arc<async_singleflight::Group<Option<V>, anyhow::Error>>,
+    pub(crate) mfg: Arc<async_singleflight::Group<Vec<(K, V)>, anyhow::Error>>,
 
     pub(crate) namespace: Option<String>,
     pub(crate) expire_time: std::time::Duration,
@@ -31,19 +33,93 @@ where
     pub(crate) max_batch_size: usize,
     pub(crate) async_set_cache: bool,
     pub(crate) use_expired_data: bool, // means async source
+
+    pub(crate) input: ArcSwapOption<tokio::sync::mpsc::Sender<AsyncSourceTask<K>>>,
+    pub(crate) stop_ch: Option<tokio::sync::mpsc::Sender<()>>,
 }
 
 impl<K, V, C> AutoCache<K, V, C>
 where
-    K: Clone + std::cmp::PartialEq + AsRef<str> + Codec + Debug,
-    V: Clone + Codec + Debug,
-    C: Cache<Key = K, Value = Entry<K, V>>,
+    K: Clone + std::cmp::PartialEq + AsRef<str> + Codec + Debug + Send + 'static + Sync,
+    V: Clone + Codec + Debug + Send + Sync + 'static,
+    C: Cache<Key = K, Value = Entry<K, V>> + Send + Sync + 'static,
 {
     pub fn builder() -> AutoCacheBuilder<K, V, C> {
         AutoCacheBuilder::new()
     }
 
-    fn filter_missed_key_and_unexpred_entry(
+    pub(crate) fn start(&mut self) -> Result<()> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        self.stop_ch.replace(tx);
+
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(512);
+        self.input.store(Some(Arc::new(input_tx)));
+
+        let loader = self.loader.clone();
+        let cache = self.cache_store.clone();
+        let cache_none = self.cache_none;
+        let expire_time = self.expire_time;
+        let none_value_expire_time = self.none_value_expire_time;
+        let sfg = self.sfg.clone();
+        let mfg = self.mfg.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = rx.recv() => {
+                        break;
+                    }
+                    t = input_rx.recv() => {
+                        let Some(t) = t else {
+                            continue;
+                        };
+
+                        let _ = match *loader {
+                            Loader::SingleLoader(_) => {
+                                Self::source_by_sloader(
+                                    &t.keys,
+                                    loader.clone(),
+                                    sfg.clone(),
+                                    cache.clone(),
+                                    cache_none,
+                                    expire_time,
+                                    none_value_expire_time,
+                                    false,
+                                )
+                                .await.inspect_err(|e| error!("async source by sloader failed, error {e}"))
+                            }
+                            Loader::MultiLoader(_) => {
+                                Self::source_by_mloader(
+                                    &t.keys,
+                                    loader.clone(),
+                                    mfg.clone(),
+                                    cache.clone(),
+                                    cache_none,
+                                    expire_time,
+                                    none_value_expire_time,
+                                    false,
+                                )
+                                .await.inspect_err(|e| error!("async source by mloader failed, error {e}"))
+                            }
+                        };
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    pub async fn stop(&self) -> Result<()> {
+        if let Some(s) = self.stop_ch.as_ref() {
+            s.send(()).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn filter_missed_key_and_unexpired_entry(
+        &self,
         keys: &[K],
         entries: Vec<Entry<K, V>>,
     ) -> (Vec<K>, Vec<Entry<K, V>>) {
@@ -51,7 +127,7 @@ where
             .iter()
             .filter_map(|key| {
                 for ent in entries.iter() {
-                    if &ent.key == key && !ent.is_outdated() {
+                    if &ent.key == key && !ent.is_outdated() && !self.use_expired_data {
                         return None;
                     }
                 }
@@ -59,6 +135,27 @@ where
                 Some(key.clone())
             })
             .collect::<Vec<_>>();
+
+        if self.use_expired_data {
+            let expired_keys = entries
+                .iter()
+                .filter_map(|e| e.is_outdated().then(|| e.key.clone()))
+                .collect::<Vec<_>>();
+
+            let keys_vector = expired_keys.chunks(self.max_batch_size).collect::<Vec<_>>();
+
+            for keys in keys_vector.into_iter() {
+                if let Some(input) = self.input.load().as_ref() {
+                    let _ = input
+                        .send(AsyncSourceTask {
+                            _crate_time: Utc::now(),
+                            keys: keys.to_vec(),
+                        })
+                        .await
+                        .inspect_err(|e| error!("send async source task failed!, error: {e}"));
+                }
+            }
+        }
 
         let entries = entries
             .into_iter()
@@ -75,18 +172,24 @@ where
         (missed_keys, entries)
     }
 
-    async fn mget_by_sloader(&self, keys: &[K]) -> Result<Vec<(K, V)>> {
-        let entries = self.cache_store.mget(keys).await?;
-        let (missed_keys, mut entries) = Self::filter_missed_key_and_unexpred_entry(keys, entries);
-
-        let Loader::<K, V>::SingleLoader(ref sloader) = self.loader else {
+    async fn source_by_sloader(
+        keys: &[K],
+        loader: Arc<Loader<K, V>>,
+        sfg: Arc<async_singleflight::Group<Option<V>, anyhow::Error>>,
+        cache: Arc<C>,
+        cache_none: bool,
+        expire_time: std::time::Duration,
+        none_value_expire_time: std::time::Duration,
+        async_set_cache: bool,
+    ) -> Result<Vec<Entry<K, V>>> {
+        let Loader::<K, V>::SingleLoader(ref sloader) = *loader else {
             unreachable!();
         };
 
-        let mut missed_entries = Vec::with_capacity(missed_keys.len());
-        for key in missed_keys.iter() {
-            let (value, err, _owner) = self
-                .sfg
+        let mut ret = Vec::with_capacity(keys.len());
+
+        for key in keys.iter() {
+            let (value, err, _owner) = sfg
                 .work(key.as_ref(), (|| async { (sloader)(key.clone()).await })())
                 .await;
 
@@ -96,14 +199,14 @@ where
             if value.is_none() {} // FIXME:
             let value = value.unwrap();
 
-            if value.is_none() && !self.cache_none {
+            if value.is_none() && !cache_none {
                 continue;
             }
 
             let expire_time = if value.is_none() {
-                self.none_value_expire_time
+                none_value_expire_time
             } else {
-                self.expire_time
+                expire_time
             };
             let entry = Entry {
                 key: key.clone(),
@@ -112,36 +215,48 @@ where
                     .timestamp_millis(),
             };
 
-            missed_entries.push(entry.clone());
+            ret.push(entry.clone());
 
-            self.cache_store.mset(&[(key.clone(), entry)]).await?;
+            if async_set_cache {
+                let key = key.clone();
+                let entry = entry.clone();
+                let cache = cache.clone();
+                tokio::spawn(async move {
+                    let _ = cache
+                        .mset(&[(key.clone(), entry)])
+                        .await
+                        .inspect_err(|e| error!("mset cache failed, error: {e}"));
+                });
+            } else {
+                cache.mset(&[(key.clone(), entry)]).await?;
+            }
         }
 
-        entries.append(&mut missed_entries);
-
-        Ok(entries
-            .into_iter()
-            .filter_map(|entry| entry.value.map(|value| (entry.key, value)))
-            .collect())
+        Ok(ret)
     }
 
-    async fn mget_by_mloader(&self, keys: &[K]) -> Result<Vec<(K, V)>> {
-        let entries = self.cache_store.mget(keys).await?;
-        let (missed_keys, mut entries) = Self::filter_missed_key_and_unexpred_entry(keys, entries);
-
-        let Loader::<K, V>::MultiLoader(ref mloader) = self.loader else {
+    async fn source_by_mloader(
+        keys: &[K],
+        loader: Arc<Loader<K, V>>,
+        mfg: Arc<async_singleflight::Group<Vec<(K, V)>, anyhow::Error>>,
+        cache: Arc<C>,
+        cache_none: bool,
+        expire_time: std::time::Duration,
+        none_value_expire_time: std::time::Duration,
+        async_set_cache: bool,
+    ) -> Result<Vec<Entry<K, V>>> {
+        let Loader::<K, V>::MultiLoader(ref mloader) = *loader else {
             unreachable!();
         };
 
         let sfg_key = {
-            let mut a = missed_keys.iter().map(|k| k.as_ref()).collect::<Vec<_>>();
+            let mut a = keys.iter().map(|k| k.as_ref()).collect::<Vec<_>>();
             a.sort();
             a.join(",")
         };
 
-        let (kvs, err, _owner) = self
-            .mfg
-            .work(&sfg_key, (|| async { (mloader)(&missed_keys).await })())
+        let (kvs, err, _owner) = mfg
+            .work(&sfg_key, (|| async { (mloader)(&keys).await })())
             .await;
 
         if err.is_some() {
@@ -150,7 +265,7 @@ where
 
         let kvs = kvs.unwrap();
 
-        let missed_key_entries = missed_keys
+        let key_entries = keys
             .iter()
             .filter_map(|k| {
                 for kv in kvs.iter() {
@@ -161,46 +276,157 @@ where
                                 key: kv.0.clone(),
                                 value: Some(kv.1.clone()),
                                 expire_at_ms: (Utc::now()
-                                    + Duration::from_std(self.expire_time).unwrap())
+                                    + Duration::from_std(expire_time).unwrap())
                                 .timestamp_millis(),
                             },
                         ));
                     }
                 }
-                self.cache_none.then(|| {
+                cache_none.then(|| {
                     (
                         k.clone(),
                         Entry {
                             key: k.clone(),
                             value: None,
                             expire_at_ms: (Utc::now()
-                                + Duration::from_std(self.none_value_expire_time).unwrap())
+                                + Duration::from_std(none_value_expire_time).unwrap())
                             .timestamp_millis(),
                         },
                     )
                 })
             })
             .collect::<Vec<_>>();
-        self.cache_store.mset(&missed_key_entries).await?;
 
-        let mut missed_entries = missed_key_entries
-            .into_iter()
-            .map(|(_, e)| e)
-            .collect::<Vec<_>>();
+        if async_set_cache {
+            let key_entries = key_entries.clone();
+            tokio::spawn(async move {
+                let _ = cache
+                    .mset(&key_entries)
+                    .await
+                    .inspect_err(|e| error!("mset cache failed, error: {e}"));
+            });
+        } else {
+            cache.mset(&key_entries).await?;
+        }
+
+        Ok(key_entries.into_iter().map(|(_, e)| e).collect::<Vec<_>>())
+    }
+
+    pub async fn mget(&self, keys: &[K]) -> Result<Vec<(K, V)>> {
+        if self.source_first {
+            return self.mget_with_source_first(keys).await;
+        }
+
+        let entries = self.cache_store.mget(keys).await?;
+        let (missed_keys, mut entries) = self
+            .filter_missed_key_and_unexpired_entry(keys, entries)
+            .await;
+
+        let mut missed_entries = match *self.loader {
+            Loader::SingleLoader(_) => {
+                Self::source_by_sloader(
+                    &missed_keys,
+                    self.loader.clone(),
+                    self.sfg.clone(),
+                    self.cache_store.clone(),
+                    self.cache_none,
+                    self.expire_time,
+                    self.none_value_expire_time,
+                    self.async_set_cache,
+                )
+                .await?
+            }
+            Loader::MultiLoader(_) => {
+                let missed_key_vector = missed_keys.chunks(self.max_batch_size).collect::<Vec<_>>();
+
+                let mut entries: Vec<Entry<K, V>> = Vec::with_capacity(keys.len());
+                for keys in missed_key_vector.into_iter() {
+                    entries.append(
+                        &mut Self::source_by_mloader(
+                            keys,
+                            self.loader.clone(),
+                            self.mfg.clone(),
+                            self.cache_store.clone(),
+                            self.cache_none,
+                            self.expire_time,
+                            self.none_value_expire_time,
+                            self.async_set_cache,
+                        )
+                        .await?,
+                    );
+                }
+
+                entries
+            }
+        };
 
         entries.append(&mut missed_entries);
 
         Ok(entries
             .into_iter()
-            .map(|entry| (entry.key, entry.value.unwrap()))
+            .filter_map(|entry| entry.value.map(|value| (entry.key, value)))
             .collect())
     }
 
-    pub async fn mget(&self, keys: &[K]) -> Result<Vec<(K, V)>> {
-        match self.loader {
-            Loader::SingleLoader(_) => self.mget_by_sloader(keys).await,
-            Loader::MultiLoader(_) => self.mget_by_mloader(keys).await,
-        }
+    pub async fn mget_with_source_first(&self, keys: &[K]) -> Result<Vec<(K, V)>> {
+        let mut entries = match *self.loader {
+            Loader::SingleLoader(_) => {
+                Self::source_by_sloader(
+                    &keys,
+                    self.loader.clone(),
+                    self.sfg.clone(),
+                    self.cache_store.clone(),
+                    self.cache_none,
+                    self.expire_time,
+                    self.none_value_expire_time,
+                    self.async_set_cache,
+                )
+                .await?
+            }
+            Loader::MultiLoader(_) => {
+                let missed_key_vector = keys.chunks(self.max_batch_size).collect::<Vec<_>>();
+
+                let mut entries: Vec<Entry<K, V>> = Vec::with_capacity(keys.len());
+                for keys in missed_key_vector.into_iter() {
+                    entries.append(
+                        &mut Self::source_by_mloader(
+                            keys,
+                            self.loader.clone(),
+                            self.mfg.clone(),
+                            self.cache_store.clone(),
+                            self.cache_none,
+                            self.expire_time,
+                            self.none_value_expire_time,
+                            self.async_set_cache,
+                        )
+                        .await?,
+                    );
+                }
+
+                entries
+            }
+        };
+
+        let missed_keys = keys
+            .iter()
+            .filter_map(|k| {
+                for e in entries.iter() {
+                    if &e.key == k {
+                        return None;
+                    }
+                }
+                return Some(k.clone());
+            })
+            .collect::<Vec<_>>();
+
+        let mut missed_entries = self.cache_store.mget(&missed_keys).await?;
+
+        entries.append(&mut missed_entries);
+
+        Ok(entries
+            .into_iter()
+            .filter_map(|entry| entry.value.map(|value| (entry.key, value)))
+            .collect())
     }
 
     pub async fn mset(&mut self, kvs: &[(K, V)]) -> Result<()> {
@@ -227,4 +453,9 @@ where
     pub async fn mdel(&mut self, keys: &[K]) -> Result<()> {
         self.cache_store.mdel(keys).await
     }
+}
+
+pub(crate) struct AsyncSourceTask<T> {
+    _crate_time: chrono::DateTime<Utc>,
+    keys: Vec<T>,
 }

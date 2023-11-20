@@ -6,6 +6,11 @@ pub trait Cache {
 
     // return partial results when some keys are not found
     async fn mget(&self, keys: &[Self::Key]) -> Result<Vec<Self::Value>>;
-    async fn mset(&self, kvs: &[(Self::Key, Self::Value)]) -> Result<()>;
+
+    fn mset(
+        &self,
+        kvs: &[(Self::Key, Self::Value)],
+    ) -> impl std::future::Future<Output = Result<()>> + std::marker::Send;
+    // async fn mset(&self, kvs: &[(Self::Key, Self::Value)]) -> Result<()>;
     async fn mdel(&self, keys: &[Self::Key]) -> Result<()>;
 }
