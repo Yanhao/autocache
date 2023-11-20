@@ -1,9 +1,9 @@
 use anyhow::Result;
 use futures::future::BoxFuture;
 
-use crate::{acache::Acache, cache::Cache, codec::Codec, entry::Entry, loader::Loader};
+use crate::{autocache::AutoCache, cache::Cache, codec::Codec, entry::Entry, loader::Loader};
 
-pub struct AcacheBuilder<K, V, C>
+pub struct AutoCacheBuilder<K, V, C>
 where
     K: Clone + std::cmp::PartialEq + AsRef<str> + Codec,
     V: Clone + Codec,
@@ -23,7 +23,7 @@ where
     pub(crate) namespace: Option<String>,
 }
 
-impl<K, V, C> AcacheBuilder<K, V, C>
+impl<K, V, C> AutoCacheBuilder<K, V, C>
 where
     K: Clone + std::cmp::PartialEq + AsRef<str> + Codec,
     V: Clone + Codec,
@@ -106,8 +106,8 @@ where
         self
     }
 
-    pub fn build(self) -> Acache<K, V, C> {
-        Acache::<K, V, C> {
+    pub fn build(self) -> AutoCache<K, V, C> {
+        AutoCache::<K, V, C> {
             cache_store: self.cache.unwrap(),
             loader: self.loader.unwrap(),
             namespace: self.namespace,

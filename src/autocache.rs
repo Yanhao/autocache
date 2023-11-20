@@ -4,14 +4,14 @@ use anyhow::Result;
 use chrono::{prelude::*, Duration};
 
 use crate::{
-    builder::AcacheBuilder,
+    builder::AutoCacheBuilder,
     cache::Cache,
     codec::Codec,
     entry::{Entry, EntryTrait},
     loader::Loader,
 };
 
-pub struct Acache<K, V, C>
+pub struct AutoCache<K, V, C>
 where
     K: Clone + std::cmp::PartialEq + AsRef<str> + Codec,
     V: Clone + Codec,
@@ -33,14 +33,14 @@ where
     pub(crate) use_expired_data: bool, // means async source
 }
 
-impl<K, V, C> Acache<K, V, C>
+impl<K, V, C> AutoCache<K, V, C>
 where
     K: Clone + std::cmp::PartialEq + AsRef<str> + Codec + Debug,
     V: Clone + Codec + Debug,
     C: Cache<Key = K, Value = Entry<K, V>>,
 {
-    pub fn builder() -> AcacheBuilder<K, V, C> {
-        AcacheBuilder::new()
+    pub fn builder() -> AutoCacheBuilder<K, V, C> {
+        AutoCacheBuilder::new()
     }
 
     fn filter_missed_key_and_unexpred_entry(

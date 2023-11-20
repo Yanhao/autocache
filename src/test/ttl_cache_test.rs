@@ -1,6 +1,6 @@
 use futures::FutureExt;
 
-use crate::{acache::Acache, codec::Codec, ttl_cache::TtlCache};
+use crate::{autocache::AutoCache, codec::Codec, ttl_cache::TtlCache};
 
 #[tokio::test]
 async fn test_builder() {
@@ -9,7 +9,7 @@ async fn test_builder() {
 
     let a = |key: String| async move { Ok(Some(key.clone())) }.boxed();
 
-    let ac = Acache::builder()
+    let ac = AutoCache::builder()
         .cache(ttl_cache)
         .expire_time(std::time::Duration::from_secs(60))
         .single_loader(a)

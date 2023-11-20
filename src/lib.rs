@@ -3,7 +3,7 @@
 #![feature(type_alias_impl_trait)]
 #![feature(associated_type_defaults)]
 
-pub mod acache;
+pub mod autocache;
 pub mod builder;
 pub mod cache;
 pub mod codec;

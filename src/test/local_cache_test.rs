@@ -1,13 +1,13 @@
 use futures::FutureExt;
 
 use crate::{
-    acache::Acache,
+    autocache::AutoCache,
     local_cache::{LocalCache, LocalCacheOption},
 };
 
 #[tokio::test]
 async fn test_builder() {
-    let ac = Acache::builder()
+    let ac = AutoCache::builder()
         .cache(LocalCache::new(LocalCacheOption {
             segments: 8,
             max_capacity: 64,
