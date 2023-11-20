@@ -39,7 +39,7 @@ where
             expire_time: std::time::Duration::from_secs(60),
             none_value_expire_time: std::time::Duration::from_secs(60),
             max_batch_size: 100,
-            async_set_cache: true,
+            async_set_cache: false,
 
             source_first: false,
             use_expired_data: false,

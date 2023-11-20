@@ -7,6 +7,8 @@ use crate::{
 
 #[tokio::test]
 async fn test_builder() {
+    tracing_subscriber::fmt::init();
+
     let ac = AutoCache::builder()
         .cache(LocalCache::new(LocalCacheOption {
             segments: 8,

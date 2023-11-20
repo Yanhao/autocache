@@ -26,3 +26,4 @@ moka = { version =  "0.12", features = [ "sync" ] }
 derivative = "2"
 arc-swap = "1.6"
 tracing = "0.1"
+tracing-subscriber = "0.3"

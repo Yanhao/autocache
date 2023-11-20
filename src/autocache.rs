@@ -201,12 +201,13 @@ where
             let value = value.unwrap();
 
             if value.is_none() {
-                debug!(msg = "autocache: value is none", key = ?key);
+                debug!(msg = "autocache: source value is none", key = ?key);
 
                 if !cache_none {
                     continue;
                 }
             }
+            debug!(msg = "autocache: source value from single loader", key = ?key);
 
             let expire_time = if value.is_none() {
                 none_value_expire_time
