@@ -1,8 +1,9 @@
-use std::hash::Hash;
+use std::{fmt::Debug, hash::Hash};
 
 use anyhow::Result;
 use derivative::Derivative;
 use moka::sync::SegmentedCache;
+use tracing::debug;
 
 use crate::cache::Cache;
 
@@ -42,13 +43,15 @@ where
 
 impl<K, V> Cache for LocalCache<K, V>
 where
-    K: Hash + Eq + Sync + Send + Clone + 'static,
+    K: Hash + Eq + Sync + Send + Clone + 'static + Debug,
     V: Clone + Sync + Send + 'static,
 {
     type Key = K;
     type Value = V;
 
     async fn mget(&self, keys: &[Self::Key]) -> Result<Vec<Self::Value>> {
+        debug!("autocache: localcache: mget keys: {keys:?}");
+
         Ok(keys
             .iter()
             .filter_map(|key| self.data.get(key).clone())
@@ -56,6 +59,11 @@ where
     }
 
     async fn mset(&self, kvs: &[(Self::Key, Self::Value)]) -> Result<()> {
+        debug!(
+            "autocache: localcache: mset keys: {:?}",
+            kvs.iter().map(|(k, _)| k).collect::<Vec<_>>()
+        );
+
         for kv in kvs.into_iter() {
             self.data.insert(kv.0.clone(), kv.1.clone());
         }
@@ -64,6 +72,8 @@ where
     }
 
     async fn mdel(&self, keys: &[Self::Key]) -> Result<()> {
+        debug!("autocache: localcache: mdel keys: {keys:?}");
+
         keys.iter().for_each(|key| {
             self.data.remove(key);
         });

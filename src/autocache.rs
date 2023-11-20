@@ -3,7 +3,7 @@ use std::{fmt::Debug, sync::Arc};
 use anyhow::Result;
 use arc_swap::ArcSwapOption;
 use chrono::{prelude::*, Duration};
-use tracing::error;
+use tracing::{debug, error};
 
 use crate::{
     builder::AutoCacheBuilder,
@@ -194,13 +194,18 @@ where
                 .await;
 
             if err.is_some() {
+                error!(msg = "autocache: single source failed", error = ?err, key = ?key);
                 anyhow::bail!("single flight error");
             }
             if value.is_none() {} // FIXME:
             let value = value.unwrap();
 
-            if value.is_none() && !cache_none {
-                continue;
+            if value.is_none() {
+                debug!(msg = "autocache: value is none", key = ?key);
+
+                if !cache_none {
+                    continue;
+                }
             }
 
             let expire_time = if value.is_none() {
@@ -222,12 +227,14 @@ where
                 let entry = entry.clone();
                 let cache = cache.clone();
                 tokio::spawn(async move {
+                    debug!(msg = "autocache: async set cache", key = ?key);
                     let _ = cache
                         .mset(&[(key.clone(), entry)])
                         .await
                         .inspect_err(|e| error!("mset cache failed, error: {e}"));
                 });
             } else {
+                debug!(msg = "autocache: sync set cache", key = ?key);
                 cache.mset(&[(key.clone(), entry)]).await?;
             }
         }
@@ -321,6 +328,10 @@ where
         let (missed_keys, mut entries) = self
             .filter_missed_key_and_unexpired_entry(keys, entries)
             .await;
+
+        debug!(msg = "autocache: mget from cache", keys = ?keys, ret = ?{
+            entries.iter().map(|e| e.key.clone()).collect::<Vec<_>>()
+        });
 
         let mut missed_entries = match *self.loader {
             Loader::SingleLoader(_) => {
