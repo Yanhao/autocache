@@ -52,7 +52,7 @@ where
 
     pub fn single_loader(
         mut self,
-        l: impl Fn(K) -> BoxFuture<'static, Result<V>> + 'static,
+        l: impl Fn(K) -> BoxFuture<'static, Result<Option<V>>> + 'static,
     ) -> Self {
         self.loader = Some(Loader::SingleLoader(Box::new(l)));
         self

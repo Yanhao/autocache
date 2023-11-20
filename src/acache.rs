@@ -20,7 +20,7 @@ where
     pub(crate) cache_store: C,
     pub(crate) loader: Loader<K, V>,
 
-    pub(crate) sfg: async_singleflight::Group<V, anyhow::Error>,
+    pub(crate) sfg: async_singleflight::Group<Option<V>, anyhow::Error>,
     pub(crate) mfg: async_singleflight::Group<Vec<(K, V)>, anyhow::Error>,
 
     pub(crate) namespace: Option<String>,
@@ -43,21 +43,41 @@ where
         AcacheBuilder::new()
     }
 
-    async fn mget_by_sloader(&self, keys: &[K]) -> Result<Vec<(K, V)>> {
-        let mut entries = self.cache_store.mget(keys).await?;
-
+    fn filter_missed_key_and_unexpred_entry(
+        keys: &[K],
+        entries: Vec<Entry<K, V>>,
+    ) -> (Vec<K>, Vec<Entry<K, V>>) {
         let missed_keys = keys
             .iter()
             .filter_map(|key| {
                 for ent in entries.iter() {
-                    if &ent.key == key {
+                    if &ent.key == key && !ent.is_outdated() {
                         return None;
                     }
                 }
 
-                return Some(key.clone());
+                Some(key.clone())
             })
             .collect::<Vec<_>>();
+
+        let entries = entries
+            .into_iter()
+            .filter_map(|x| {
+                for key in missed_keys.iter() {
+                    if &x.key == key {
+                        return None;
+                    }
+                }
+                Some(x)
+            })
+            .collect::<Vec<_>>();
+
+        (missed_keys, entries)
+    }
+
+    async fn mget_by_sloader(&self, keys: &[K]) -> Result<Vec<(K, V)>> {
+        let entries = self.cache_store.mget(keys).await?;
+        let (missed_keys, mut entries) = Self::filter_missed_key_and_unexpred_entry(keys, entries);
 
         let Loader::<K, V>::SingleLoader(ref sloader) = self.loader else {
             unreachable!();
@@ -73,11 +93,22 @@ where
             if err.is_some() {
                 anyhow::bail!("single flight error");
             }
+            if value.is_none() {} // FIXME:
+            let value = value.unwrap();
 
+            if value.is_none() && !self.cache_none {
+                continue;
+            }
+
+            let expire_time = if value.is_none() {
+                self.none_value_expire_time
+            } else {
+                self.expire_time
+            };
             let entry = Entry {
                 key: key.clone(),
-                value: Some(value.unwrap()),
-                expire_at_ms: (Utc::now() + Duration::from_std(self.expire_time).unwrap())
+                value,
+                expire_at_ms: (Utc::now() + Duration::from_std(expire_time).unwrap())
                     .timestamp_millis(),
             };
 
@@ -90,23 +121,13 @@ where
 
         Ok(entries
             .into_iter()
-            .map(|entry| (entry.key, entry.value.unwrap()))
+            .filter_map(|entry| entry.value.map(|value| (entry.key, value)))
             .collect())
     }
 
     async fn mget_by_mloader(&self, keys: &[K]) -> Result<Vec<(K, V)>> {
-        let mut entries = self.cache_store.mget(keys).await?;
-
-        let missed_keys = entries
-            .iter()
-            .filter_map(|entry| {
-                if keys.contains(&entry.key) && !entry.is_outdated() {
-                    None
-                } else {
-                    Some(entry.key.clone())
-                }
-            })
-            .collect::<Vec<_>>();
+        let entries = self.cache_store.mget(keys).await?;
+        let (missed_keys, mut entries) = Self::filter_missed_key_and_unexpred_entry(keys, entries);
 
         let Loader::<K, V>::MultiLoader(ref mloader) = self.loader else {
             unreachable!();
@@ -129,18 +150,35 @@ where
 
         let kvs = kvs.unwrap();
 
-        let missed_key_entries = kvs
-            .into_iter()
-            .map(|kv| {
-                (
-                    kv.0.clone(),
-                    Entry {
-                        key: kv.0.clone(),
-                        value: Some(kv.1.clone()),
-                        expire_at_ms: (Utc::now() + Duration::from_std(self.expire_time).unwrap())
+        let missed_key_entries = missed_keys
+            .iter()
+            .filter_map(|k| {
+                for kv in kvs.iter() {
+                    if &kv.0 == k {
+                        return Some((
+                            kv.0.clone(),
+                            Entry {
+                                key: kv.0.clone(),
+                                value: Some(kv.1.clone()),
+                                expire_at_ms: (Utc::now()
+                                    + Duration::from_std(self.expire_time).unwrap())
+                                .timestamp_millis(),
+                            },
+                        ));
+                    }
+                }
+                self.cache_none.then(|| {
+                    (
+                        k.clone(),
+                        Entry {
+                            key: k.clone(),
+                            value: None,
+                            expire_at_ms: (Utc::now()
+                                + Duration::from_std(self.none_value_expire_time).unwrap())
                             .timestamp_millis(),
-                    },
-                )
+                        },
+                    )
+                })
             })
             .collect::<Vec<_>>();
         self.cache_store.mset(&missed_key_entries).await?;

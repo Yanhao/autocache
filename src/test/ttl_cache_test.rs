@@ -7,7 +7,7 @@ async fn test_builder() {
     let mut ttl_cache: TtlCache<String, _> = TtlCache::new();
     let _ = ttl_cache.start();
 
-    let a = |key: String| async move { Ok(key.clone()) }.boxed();
+    let a = |key: String| async move { Ok(Some(key.clone())) }.boxed();
 
     let ac = Acache::builder()
         .cache(ttl_cache)
