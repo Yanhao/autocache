@@ -20,7 +20,7 @@ where
 pub struct LocalCacheOption {
     #[derivative(Default(value = "8"))]
     pub segments: usize,
-    #[derivative(Default(value = "std::time::Duration::from_secs( 5 * 60)"))]
+    #[derivative(Default(value = "std::time::Duration::from_secs(5 * 60)"))]
     pub ttl: std::time::Duration,
     #[derivative(Default(value = "1024"))]
     pub max_capacity: u64,

@@ -139,14 +139,17 @@ where
             .iter()
             .filter_map(|key| {
                 for ent in entries.iter() {
-                    if &ent.key == key && !ent.is_outdated() && !self.use_expired_data {
-                        return None;
+                    if &ent.key == key {
+                        if self.use_expired_data || !ent.is_outdated() {
+                            return None;
+                        }
                     }
                 }
 
                 Some(key.clone())
             })
             .collect::<Vec<_>>();
+        debug!(msg = "autocache: missed_keys", keys = ?missed_keys);
 
         if self.use_expired_data {
             let expired_keys = entries
@@ -339,6 +342,10 @@ where
 
         let mut from = "-";
         let entries = self.cache_store.mget(keys).await?;
+        debug!(msg = "autocache: mget from cache before filter", keys = ?keys, ret = ?{
+            entries.iter().map(|e| e.key.clone()).collect::<Vec<_>>()
+        });
+
         let (missed_keys, mut entries) = self
             .filter_missed_key_and_unexpired_entry(keys, entries)
             .await;
