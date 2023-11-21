@@ -20,6 +20,7 @@ pub mod twolevel_cache;
 mod test;
 
 pub use autocache::AutoCache;
+pub use builder::AutoCacheBuilder;
 pub use cache::Cache;
 pub use codec::Codec;
-pub use entry::{EntryTrait, SerilizableEntryTrait};
+pub use entry::{Entry, EntryTrait, SerilizableEntryTrait};
