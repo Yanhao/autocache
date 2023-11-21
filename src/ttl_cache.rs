@@ -4,20 +4,12 @@ use anyhow::Result;
 
 use crate::{cache::Cache, entry::EntryTrait};
 
-pub struct TtlCache<K, V>
-where
-    K: Ord + Sync + Send + Clone,
-    V: Clone + Sync + Send,
-{
+pub struct TtlCache<K, V> {
     data: Arc<parking_lot::RwLock<im::OrdMap<K, V>>>,
     stop_notifier: Option<Arc<tokio::sync::Notify>>,
 }
 
-impl<K, V> TtlCache<K, V>
-where
-    K: Ord + Sync + Send + Clone,
-    V: Clone + Sync + Send,
-{
+impl<K, V> TtlCache<K, V> {
     pub fn new() -> Self {
         Self {
             data: Arc::new(parking_lot::RwLock::new(im::OrdMap::new())),

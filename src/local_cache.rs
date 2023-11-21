@@ -7,11 +7,7 @@ use tracing::debug;
 
 use crate::cache::Cache;
 
-pub struct LocalCache<K, V>
-where
-    K: Hash + Eq + Sync + Send + Clone,
-    V: Clone + Sync + Send,
-{
+pub struct LocalCache<K, V> {
     data: SegmentedCache<K, V>,
 }
 
@@ -29,7 +25,7 @@ pub struct LocalCacheOption {
 impl<K, V> LocalCache<K, V>
 where
     K: Hash + Eq + Sync + Send + Clone + 'static,
-    V: Clone + Sync + Send + 'static,
+    V: Sync + Send + Clone + 'static,
 {
     pub fn new(opts: LocalCacheOption) -> Self {
         let data = SegmentedCache::builder(opts.segments)
@@ -43,8 +39,8 @@ where
 
 impl<K, V> Cache for LocalCache<K, V>
 where
-    K: Hash + Eq + Sync + Send + Clone + 'static + Debug,
-    V: Clone + Sync + Send + 'static,
+    K: Hash + Eq + Sync + Send + Clone + Debug + 'static,
+    V: Sync + Send + Clone + 'static,
 {
     type Key = K;
     type Value = V;

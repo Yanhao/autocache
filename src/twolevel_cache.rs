@@ -1,12 +1,6 @@
-use crate::{cache::Cache, codec::Codec, entry::EntryTrait};
+use crate::{cache::Cache, entry::EntryTrait};
 
-pub struct TwoLevelCache<K, V, L1, L2>
-where
-    K: Ord + Sync + Send + AsRef<str> + Codec + Clone,
-    V: Clone + Sync + Send + Codec,
-    L1: Cache<Key = K, Value = V>,
-    L2: Cache<Key = K, Value = V>,
-{
+pub struct TwoLevelCache<K, V, L1, L2> {
     local_cache: L1,
     redis_cache: L2,
 
@@ -14,10 +8,22 @@ where
     _m2: std::marker::PhantomData<V>,
 }
 
+impl<K, V, L1, L2> TwoLevelCache<K, V, L1, L2> {
+    pub fn new(l1: L1, l2: L2) -> Self {
+        Self {
+            local_cache: l1,
+            redis_cache: l2,
+
+            _m1: std::marker::PhantomData,
+            _m2: std::marker::PhantomData,
+        }
+    }
+}
+
 impl<K, V, L1, L2> Cache for TwoLevelCache<K, V, L1, L2>
 where
-    K: Ord + Sync + Send + AsRef<str> + Codec + Clone,
-    V: Clone + Sync + Send + Codec + EntryTrait<K>,
+    K: Ord + Sync,
+    V: Clone + Sync + EntryTrait<K>,
     L1: Cache<Key = K, Value = V> + Sync,
     L2: Cache<Key = K, Value = V> + Sync,
 {

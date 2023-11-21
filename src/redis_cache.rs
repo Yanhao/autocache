@@ -2,24 +2,16 @@ use anyhow::Result;
 use bytes::Bytes;
 use redis::AsyncCommands;
 
-use crate::{cache::Cache, codec::Codec};
+use crate::{cache::Cache, SerilizableEntryTrait};
 
-pub struct RedisCache<K, V>
-where
-    K: Ord + Sync + Send + AsRef<str> + Codec,
-    V: Clone + Sync + Send + Codec,
-{
+pub struct RedisCache<K, V> {
     redis_cli: redis::Client,
 
     _m1: std::marker::PhantomData<K>,
     _m2: std::marker::PhantomData<V>,
 }
 
-impl<K, V> RedisCache<K, V>
-where
-    K: Ord + Sync + Send + AsRef<str> + Codec,
-    V: Clone + Sync + Send + Codec,
-{
+impl<K, V> RedisCache<K, V> {
     pub fn new(cli: redis::Client) -> Self {
         Self {
             redis_cli: cli,
@@ -31,8 +23,8 @@ where
 
 impl<K, V> Cache for RedisCache<K, V>
 where
-    K: Ord + Sync + Send + AsRef<str> + Codec,
-    V: Clone + Sync + Send + Codec,
+    K: Sync + AsRef<str>,
+    V: Sync + SerilizableEntryTrait,
 {
     type Key = K;
     type Value = V;

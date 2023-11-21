@@ -2,11 +2,11 @@ use std::fmt::Debug;
 
 use bytes::Buf;
 use chrono::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::codec::Codec;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct Entry<K, V> {
     pub key: K,
     pub value: Option<V>,
@@ -31,15 +31,26 @@ where
     }
 }
 
-impl<K, V> Codec for Entry<K, V>
+pub trait SerilizableEntryTrait {
+    fn decode(data: bytes::Bytes) -> anyhow::Result<Self>
+    where
+        Self: Sized;
+    fn encode(&self) -> anyhow::Result<bytes::Bytes>;
+}
+
+impl<K, V> SerilizableEntryTrait for Entry<K, V>
 where
-    K: Codec + Clone,
+    K: Serialize + DeserializeOwned + Clone,
     V: Codec,
 {
     fn decode(data: bytes::Bytes) -> anyhow::Result<Self> {
         let eni: EntryInner<K> = serde_json::from_reader(data.reader())?;
 
-        let value = serde_json::from_reader(eni.value_data.reader())?;
+        let value = if eni.value_data.is_empty() {
+            None
+        } else {
+            Some(V::decode(eni.value_data.into())?)
+        };
 
         Ok(Self {
             key: eni.key,
@@ -49,7 +60,11 @@ where
     }
 
     fn encode(&self) -> anyhow::Result<bytes::Bytes> {
-        let value_data = serde_json::to_vec(&self.value)?;
+        let value_data = match &self.value {
+            Some(v) => v.encode()?.to_vec(),
+            None => vec![],
+        };
+
         let eni = EntryInner {
             key: self.key.clone(),
             value_data,
@@ -60,7 +75,7 @@ where
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize)]
 struct EntryInner<K> {
     key: K,
     value_data: Vec<u8>,

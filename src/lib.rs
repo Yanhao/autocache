@@ -22,4 +22,4 @@ mod test;
 pub use autocache::AutoCache;
 pub use cache::Cache;
 pub use codec::Codec;
-pub use entry::EntryTrait;
+pub use entry::{EntryTrait, SerilizableEntryTrait};

@@ -3,14 +3,12 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use futures::future::BoxFuture;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
 
 use crate::{autocache::AutoCache, cache::Cache, entry::Entry, loader::Loader};
 
 pub struct AutoCacheBuilder<K, V, C>
 where
-    K: Clone + std::cmp::PartialEq + AsRef<str> + Send,
+    K: Clone,
     V: Clone,
     C: Cache<Key = K, Value = Entry<K, V>>,
 {
@@ -33,17 +31,9 @@ where
 
 impl<K, V, C> AutoCacheBuilder<K, V, C>
 where
-    K: Clone
-        + std::cmp::PartialEq
-        + AsRef<str>
-        + Debug
-        + Send
-        + 'static
-        + Sync
-        + Serialize
-        + DeserializeOwned,
-    V: Clone + Debug + Send + Sync + 'static + Serialize + DeserializeOwned,
-    C: Cache<Key = K, Value = Entry<K, V>> + Send + Sync + 'static,
+    K: Clone + Debug + PartialEq + AsRef<str> + Sync + Send + 'static,
+    V: Clone + Debug + Sync + Send + 'static,
+    C: Cache<Key = K, Value = Entry<K, V>> + Sync + Send + 'static,
 {
     pub fn new() -> Self {
         Self {

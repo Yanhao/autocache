@@ -3,8 +3,6 @@ use std::{fmt::Debug, sync::Arc};
 use anyhow::Result;
 use arc_swap::ArcSwapOption;
 use chrono::{prelude::*, Duration};
-use serde::de::DeserializeOwned;
-use serde::Serialize;
 use tracing::{debug, error};
 
 use crate::{
@@ -16,7 +14,7 @@ use crate::{
 
 pub struct AutoCache<K, V, C>
 where
-    K: Clone + std::cmp::PartialEq + AsRef<str>,
+    K: Clone,
     V: Clone,
     C: Cache<Key = K, Value = Entry<K, V>>,
 {
@@ -44,17 +42,9 @@ where
 
 impl<K, V, C> AutoCache<K, V, C>
 where
-    K: Clone
-        + std::cmp::PartialEq
-        + AsRef<str>
-        + Debug
-        + Send
-        + 'static
-        + Sync
-        + Serialize
-        + DeserializeOwned,
-    V: Clone + Debug + Send + Sync + 'static + Serialize + DeserializeOwned,
-    C: Cache<Key = K, Value = Entry<K, V>> + Send + Sync + 'static,
+    K: Clone + Debug + PartialEq + AsRef<str> + Sync + Send + 'static,
+    V: Clone + Debug + Sync + Send + 'static,
+    C: Cache<Key = K, Value = Entry<K, V>> + Sync + Send + 'static,
 {
     pub fn builder() -> AutoCacheBuilder<K, V, C> {
         AutoCacheBuilder::new()
@@ -128,63 +118,6 @@ where
         }
 
         Ok(())
-    }
-
-    async fn filter_missed_key_and_unexpired_entry(
-        &self,
-        keys: &[K],
-        entries: Vec<Entry<K, V>>,
-    ) -> (Vec<K>, Vec<Entry<K, V>>) {
-        let missed_keys = keys
-            .iter()
-            .filter_map(|key| {
-                for ent in entries.iter() {
-                    if &ent.key == key {
-                        if self.use_expired_data || !ent.is_outdated() {
-                            return None;
-                        }
-                    }
-                }
-
-                Some(key.clone())
-            })
-            .collect::<Vec<_>>();
-        debug!(msg = "autocache: missed_keys", keys = ?missed_keys);
-
-        if self.use_expired_data {
-            let expired_keys = entries
-                .iter()
-                .filter_map(|e| e.is_outdated().then(|| e.key.clone()))
-                .collect::<Vec<_>>();
-
-            let keys_vector = expired_keys.chunks(self.max_batch_size).collect::<Vec<_>>();
-
-            for keys in keys_vector.into_iter() {
-                if let Some(input) = self.input.load().as_ref() {
-                    let _ = input
-                        .send(AsyncSourceTask {
-                            _crate_time: Utc::now(),
-                            keys: keys.to_vec(),
-                        })
-                        .await
-                        .inspect_err(|e| error!("send async source task failed!, error: {e}"));
-                }
-            }
-        }
-
-        let entries = entries
-            .into_iter()
-            .filter_map(|x| {
-                for key in missed_keys.iter() {
-                    if &x.key == key {
-                        return None;
-                    }
-                }
-                Some(x)
-            })
-            .collect::<Vec<_>>();
-
-        (missed_keys, entries)
     }
 
     async fn source_by_sloader(
@@ -333,6 +266,63 @@ where
         }
 
         Ok(key_entries.into_iter().map(|(_, e)| e).collect::<Vec<_>>())
+    }
+
+    async fn filter_missed_key_and_unexpired_entry(
+        &self,
+        keys: &[K],
+        entries: Vec<Entry<K, V>>,
+    ) -> (Vec<K>, Vec<Entry<K, V>>) {
+        let missed_keys = keys
+            .iter()
+            .filter_map(|key| {
+                for ent in entries.iter() {
+                    if &ent.key == key {
+                        if self.use_expired_data || !ent.is_outdated() {
+                            return None;
+                        }
+                    }
+                }
+
+                Some(key.clone())
+            })
+            .collect::<Vec<_>>();
+        debug!(msg = "autocache: missed_keys", keys = ?missed_keys);
+
+        if self.use_expired_data {
+            let expired_keys = entries
+                .iter()
+                .filter_map(|e| e.is_outdated().then(|| e.key.clone()))
+                .collect::<Vec<_>>();
+
+            let keys_vector = expired_keys.chunks(self.max_batch_size).collect::<Vec<_>>();
+
+            for keys in keys_vector.into_iter() {
+                if let Some(input) = self.input.load().as_ref() {
+                    let _ = input
+                        .send(AsyncSourceTask {
+                            _crate_time: Utc::now(),
+                            keys: keys.to_vec(),
+                        })
+                        .await
+                        .inspect_err(|e| error!("send async source task failed!, error: {e}"));
+                }
+            }
+        }
+
+        let entries = entries
+            .into_iter()
+            .filter_map(|x| {
+                for key in missed_keys.iter() {
+                    if &x.key == key {
+                        return None;
+                    }
+                }
+                Some(x)
+            })
+            .collect::<Vec<_>>();
+
+        (missed_keys, entries)
     }
 
     pub async fn mget(&self, keys: &[K]) -> Result<Vec<(K, V)>> {
