@@ -4,13 +4,13 @@
 #![feature(associated_type_defaults)]
 #![feature(result_option_inspect)]
 
-pub mod autocache;
-pub mod builder;
-pub mod cache;
-pub mod codec;
-pub mod entry;
-pub mod error;
-pub mod loader;
+mod autocache;
+mod builder;
+mod cache;
+mod codec;
+mod entry;
+mod error;
+mod loader;
 pub mod local_cache;
 pub mod redis_cache;
 pub mod ttl_cache;
@@ -18,3 +18,8 @@ pub mod twolevel_cache;
 
 #[cfg(test)]
 mod test;
+
+pub use autocache::AutoCache;
+pub use cache::Cache;
+pub use codec::Codec;
+pub use entry::EntryTrait;

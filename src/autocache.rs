@@ -431,7 +431,7 @@ where
             .collect())
     }
 
-    pub async fn mget_with_source_first(&self, keys: &[K]) -> Result<Vec<(K, V)>> {
+    async fn mget_with_source_first(&self, keys: &[K]) -> Result<Vec<(K, V)>> {
         let mut entries = match *self.loader {
             Loader::SingleLoader(_) => {
                 Self::source_by_sloader(
