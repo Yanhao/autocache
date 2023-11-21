@@ -24,6 +24,9 @@ where
 
     pub(crate) use_expired_data: bool,
     pub(crate) namespace: Option<String>,
+
+    pub(crate) on_metrics:
+        Option<fn(method: &str, is_error: bool, ns: &str, from: &str, cache_name: &str)>,
 }
 
 impl<K, V, C> AutoCacheBuilder<K, V, C>
@@ -45,6 +48,7 @@ where
             use_expired_data: false,
             cache_none: false,
             namespace: None,
+            on_metrics: None,
         }
     }
 
@@ -109,6 +113,14 @@ where
         self
     }
 
+    pub fn on_metrics(
+        mut self,
+        func: fn(method: &str, is_error: bool, ns: &str, from: &str, cache_name: &str),
+    ) -> Self {
+        self.on_metrics = Some(func);
+        self
+    }
+
     pub fn build(self) -> AutoCache<K, V, C> {
         let mut ac = AutoCache::<K, V, C> {
             cache_store: Arc::new(self.cache.unwrap()),
@@ -127,6 +139,8 @@ where
 
             input: None.into(),
             stop_ch: None,
+
+            on_metrics: self.on_metrics,
         };
 
         if ac.use_expired_data {

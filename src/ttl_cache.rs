@@ -56,6 +56,10 @@ where
 
         Ok(())
     }
+
+    fn name(&self) -> &'static str {
+        "ttlcache"
+    }
 }
 
 impl<K, V> TtlCache<K, V>

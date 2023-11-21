@@ -87,4 +87,8 @@ where
 
         Ok(())
     }
+
+    fn name(&self) -> &'static str {
+        "rediscache"
+    }
 }

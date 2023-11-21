@@ -13,4 +13,6 @@ pub trait Cache {
     ) -> impl std::future::Future<Output = Result<()>> + std::marker::Send;
     // async fn mset(&self, kvs: &[(Self::Key, Self::Value)]) -> Result<()>;
     async fn mdel(&self, keys: &[Self::Key]) -> Result<()>;
+
+    fn name(&self) -> &'static str;
 }

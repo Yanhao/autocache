@@ -5,6 +5,8 @@ use crate::{
     local_cache::{LocalCache, LocalCacheOption},
 };
 
+fn on_metrics(_method: &str, _is_error: bool, _ns: &str, _from: &str, _cache_name: &str) {}
+
 #[tokio::test]
 async fn test_builder() {
     tracing_subscriber::fmt::init();
@@ -18,6 +20,7 @@ async fn test_builder() {
         }))
         .expire_time(std::time::Duration::from_secs(10))
         .use_expired_data(true)
+        .on_metrics(on_metrics)
         .single_loader(|key: String| {
             async move {
                 dbg!(&key);

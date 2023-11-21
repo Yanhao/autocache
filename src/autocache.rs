@@ -36,6 +36,9 @@ where
 
     pub(crate) input: ArcSwapOption<tokio::sync::mpsc::Sender<AsyncSourceTask<K>>>,
     pub(crate) stop_ch: Option<tokio::sync::mpsc::Sender<()>>,
+
+    pub(crate) on_metrics:
+        Option<fn(method: &str, is_error: bool, ns: &str, from: &str, cache_name: &str)>,
 }
 
 impl<K, V, C> AutoCache<K, V, C>
@@ -325,18 +328,22 @@ where
             return self.mget_with_source_first(keys).await;
         }
 
+        let mut from = "-";
         let entries = self.cache_store.mget(keys).await?;
         let (missed_keys, mut entries) = self
             .filter_missed_key_and_unexpired_entry(keys, entries)
             .await;
+        if !entries.is_empty() {
+            from = "cache";
+        }
 
         debug!(msg = "autocache: mget from cache", keys = ?keys, ret = ?{
             entries.iter().map(|e| e.key.clone()).collect::<Vec<_>>()
         });
 
-        let mut missed_entries = match *self.loader {
-            Loader::SingleLoader(_) => {
-                Self::source_by_sloader(
+        if !missed_keys.is_empty() {
+            let mut missed_entries = match *self.loader {
+                Loader::SingleLoader(_) => Self::source_by_sloader(
                     &missed_keys,
                     self.loader.clone(),
                     self.sfg.clone(),
@@ -346,34 +353,62 @@ where
                     self.none_value_expire_time,
                     self.async_set_cache,
                 )
-                .await?
-            }
-            Loader::MultiLoader(_) => {
-                let missed_key_vector = missed_keys.chunks(self.max_batch_size).collect::<Vec<_>>();
+                .await
+                .inspect_err(|_| {
+                    if let Some(metrics) = self.on_metrics {
+                        metrics(
+                            "mget",
+                            true,
+                            self.namespace.as_ref().unwrap_or(&"".to_string()),
+                            "source",
+                            self.cache_store.name(),
+                        );
+                    }
+                })?,
+                Loader::MultiLoader(_) => {
+                    let missed_key_vector =
+                        missed_keys.chunks(self.max_batch_size).collect::<Vec<_>>();
 
-                let mut entries: Vec<Entry<K, V>> = Vec::with_capacity(keys.len());
-                for keys in missed_key_vector.into_iter() {
-                    entries.append(
-                        &mut Self::source_by_mloader(
-                            keys,
-                            self.loader.clone(),
-                            self.mfg.clone(),
-                            self.cache_store.clone(),
-                            self.cache_none,
-                            self.expire_time,
-                            self.none_value_expire_time,
-                            self.async_set_cache,
-                        )
-                        .await?,
-                    );
+                    let mut entries: Vec<Entry<K, V>> = Vec::with_capacity(keys.len());
+                    for keys in missed_key_vector.into_iter() {
+                        entries.append(
+                            &mut Self::source_by_mloader(
+                                keys,
+                                self.loader.clone(),
+                                self.mfg.clone(),
+                                self.cache_store.clone(),
+                                self.cache_none,
+                                self.expire_time,
+                                self.none_value_expire_time,
+                                self.async_set_cache,
+                            )
+                            .await?,
+                        );
+                    }
+
+                    entries
                 }
-
-                entries
+            };
+            if !missed_entries.is_empty() {
+                if from == "cache" {
+                    from = "both";
+                } else {
+                    from = "source";
+                }
             }
-        };
 
-        entries.append(&mut missed_entries);
+            entries.append(&mut missed_entries);
+        }
 
+        if let Some(metrics) = self.on_metrics {
+            metrics(
+                "mget",
+                false,
+                self.namespace.as_ref().unwrap_or(&"".to_string()),
+                from,
+                self.cache_store.name(),
+            );
+        }
         Ok(entries
             .into_iter()
             .filter_map(|entry| entry.value.map(|value| (entry.key, value)))
