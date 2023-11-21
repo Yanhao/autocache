@@ -3,20 +3,21 @@ use std::{fmt::Debug, sync::Arc};
 use anyhow::Result;
 use arc_swap::ArcSwapOption;
 use chrono::{prelude::*, Duration};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use tracing::{debug, error};
 
 use crate::{
     builder::AutoCacheBuilder,
     cache::Cache,
-    codec::Codec,
     entry::{Entry, EntryTrait},
     loader::Loader,
 };
 
 pub struct AutoCache<K, V, C>
 where
-    K: Clone + std::cmp::PartialEq + AsRef<str> + Codec,
-    V: Clone + Codec,
+    K: Clone + std::cmp::PartialEq + AsRef<str>,
+    V: Clone,
     C: Cache<Key = K, Value = Entry<K, V>>,
 {
     pub(crate) cache_store: Arc<C>,
@@ -43,8 +44,16 @@ where
 
 impl<K, V, C> AutoCache<K, V, C>
 where
-    K: Clone + std::cmp::PartialEq + AsRef<str> + Codec + Debug + Send + 'static + Sync,
-    V: Clone + Codec + Debug + Send + Sync + 'static,
+    K: Clone
+        + std::cmp::PartialEq
+        + AsRef<str>
+        + Debug
+        + Send
+        + 'static
+        + Sync
+        + Serialize
+        + DeserializeOwned,
+    V: Clone + Debug + Send + Sync + 'static + Serialize + DeserializeOwned,
     C: Cache<Key = K, Value = Entry<K, V>> + Send + Sync + 'static,
 {
     pub fn builder() -> AutoCacheBuilder<K, V, C> {

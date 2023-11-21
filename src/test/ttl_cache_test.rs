@@ -1,6 +1,6 @@
 use futures::FutureExt;
 
-use crate::{autocache::AutoCache, codec::Codec, ttl_cache::TtlCache};
+use crate::{autocache::AutoCache, ttl_cache::TtlCache};
 
 #[tokio::test]
 async fn test_builder() {
@@ -23,4 +23,4 @@ async fn test_builder() {
     assert_eq!(v1.get(0).unwrap().1, String::from("test-key1"));
 }
 
-impl Codec for String {}
+// impl Codec for String {}
