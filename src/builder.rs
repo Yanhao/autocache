@@ -21,6 +21,7 @@ where
     pub(crate) source_first: bool,
     pub(crate) max_batch_size: usize,
     pub(crate) async_set_cache: bool,
+    pub(crate) manually_refresh: bool,
 
     pub(crate) use_expired_data: bool,
     pub(crate) namespace: Option<String>,
@@ -43,10 +44,12 @@ where
             none_value_expire_time: std::time::Duration::from_secs(60),
             max_batch_size: 100,
             async_set_cache: false,
+            cache_none: false,
 
             source_first: false,
             use_expired_data: false,
-            cache_none: false,
+            manually_refresh: false,
+
             namespace: None,
             on_metrics: None,
         }
@@ -93,6 +96,11 @@ where
         self
     }
 
+    pub fn manually_refresh(mut self, t: bool) -> Self {
+        self.manually_refresh = t;
+        self
+    }
+
     pub fn async_set_cache(mut self, t: bool) -> Self {
         self.async_set_cache = t;
         self
@@ -133,6 +141,7 @@ where
             max_batch_size: self.max_batch_size,
             async_set_cache: self.async_set_cache,
             use_expired_data: self.use_expired_data,
+            manually_refresh: self.manually_refresh,
 
             sfg: Arc::new(async_singleflight::Group::new()),
             mfg: Arc::new(async_singleflight::Group::new()),
@@ -143,7 +152,7 @@ where
             on_metrics: self.on_metrics,
         };
 
-        if ac.use_expired_data {
+        if ac.use_expired_data || ac.manually_refresh {
             ac.start().unwrap();
         }
 

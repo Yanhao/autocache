@@ -1,6 +1,6 @@
 use std::{fmt::Debug, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use arc_swap::ArcSwapOption;
 use chrono::prelude::*;
 use tracing::{debug, error};
@@ -9,6 +9,7 @@ use crate::{
     builder::AutoCacheBuilder,
     cache::Cache,
     entry::{Entry, EntryTrait},
+    error::AutoCacheError,
     loader::Loader,
 };
 
@@ -32,6 +33,7 @@ where
     pub(crate) max_batch_size: usize,
     pub(crate) async_set_cache: bool,
     pub(crate) use_expired_data: bool, // means async source
+    pub(crate) manually_refresh: bool,
 
     pub(crate) input: ArcSwapOption<tokio::sync::mpsc::Sender<AsyncSourceTask<K>>>,
     pub(crate) stop_ch: Option<tokio::sync::mpsc::Sender<()>>,
@@ -165,8 +167,10 @@ where
             let entry = Entry {
                 key: key.clone(),
                 value,
-                expire_at_ms: (Utc::now() + chrono::Duration::from_std(expire_time).unwrap())
-                    .timestamp_millis(),
+                expire_at_ms: Some(
+                    (Utc::now() + chrono::Duration::from_std(expire_time).unwrap())
+                        .timestamp_millis(),
+                ),
             };
 
             ret.push(entry.clone());
@@ -231,9 +235,10 @@ where
                             Entry {
                                 key: kv.0.clone(),
                                 value: Some(kv.1.clone()),
-                                expire_at_ms: (Utc::now()
-                                    + chrono::Duration::from_std(expire_time).unwrap())
-                                .timestamp_millis(),
+                                expire_at_ms: Some(
+                                    (Utc::now() + chrono::Duration::from_std(expire_time).unwrap())
+                                        .timestamp_millis(),
+                                ),
                             },
                         ));
                     }
@@ -244,9 +249,11 @@ where
                         Entry {
                             key: k.clone(),
                             value: None,
-                            expire_at_ms: (Utc::now()
-                                + chrono::Duration::from_std(none_value_expire_time).unwrap())
-                            .timestamp_millis(),
+                            expire_at_ms: Some(
+                                (Utc::now()
+                                    + chrono::Duration::from_std(none_value_expire_time).unwrap())
+                                .timestamp_millis(),
+                            ),
                         },
                     )
                 })
@@ -268,17 +275,17 @@ where
         Ok(key_entries.into_iter().map(|(_, e)| e).collect::<Vec<_>>())
     }
 
-    async fn filter_missed_key_and_unexpired_entry(
-        &self,
-        keys: &[K],
-        entries: Vec<Entry<K, V>>,
-    ) -> (Vec<K>, Vec<Entry<K, V>>) {
-        let missed_keys = keys
+    async fn filter_sync_source_keys(&self, keys: &[K], entries: &[Entry<K, V>]) -> Vec<K> {
+        let sync_source_keys = keys
             .iter()
             .filter_map(|key| {
                 for ent in entries.iter() {
                     if &ent.key == key {
-                        if self.use_expired_data || !ent.is_outdated() {
+                        if !ent.is_outdated() {
+                            return None;
+                        }
+
+                        if self.use_expired_data || self.manually_refresh {
                             return None;
                         }
                     }
@@ -287,9 +294,13 @@ where
                 Some(key.clone())
             })
             .collect::<Vec<_>>();
-        debug!(msg = "autocache: missed_keys", keys = ?missed_keys);
+        debug!(msg = "autocache: sync_source_keys", keys = ?sync_source_keys);
 
-        if self.use_expired_data {
+        sync_source_keys
+    }
+
+    async fn check_and_async_source(&self, entries: &[Entry<K, V>]) {
+        if self.use_expired_data && !self.manually_refresh {
             let expired_keys = entries
                 .iter()
                 .filter_map(|e| e.is_outdated().then(|| e.key.clone()))
@@ -305,24 +316,35 @@ where
                             keys: keys.to_vec(),
                         })
                         .await
-                        .inspect_err(|e| error!("send async source task failed!, error: {e}"));
+                        .inspect_err(|e| {
+                            error!("autocache: send async source task failed!, error: {e}")
+                        });
                 }
             }
         }
+    }
 
-        let entries = entries
+    async fn filter_unexpired_entry(
+        &self,
+        sync_source_keys: &[K],
+        entries: Vec<Entry<K, V>>,
+    ) -> Vec<Entry<K, V>> {
+        entries
             .into_iter()
-            .filter_map(|x| {
-                for key in missed_keys.iter() {
-                    if &x.key == key {
+            .filter_map(|ent| {
+                if ent.is_outdated() && !self.use_expired_data {
+                    return None;
+                }
+
+                for key in sync_source_keys.iter() {
+                    if &ent.key == key {
                         return None;
                     }
                 }
-                Some(x)
-            })
-            .collect::<Vec<_>>();
 
-        (missed_keys, entries)
+                Some(ent)
+            })
+            .collect::<Vec<_>>()
     }
 
     pub async fn mget(&self, keys: &[K]) -> Result<Vec<(K, V)>> {
@@ -336,8 +358,11 @@ where
             entries.iter().map(|e| e.key.clone()).collect::<Vec<_>>()
         });
 
-        let (missed_keys, mut entries) = self
-            .filter_missed_key_and_unexpired_entry(keys, entries)
+        let sync_source_keys = self.filter_sync_source_keys(keys, &entries).await;
+        self.check_and_async_source(&entries).await;
+
+        let mut entries = self
+            .filter_unexpired_entry(&sync_source_keys, entries)
             .await;
         if !entries.is_empty() {
             from = "cache";
@@ -347,10 +372,10 @@ where
             entries.iter().map(|e| e.key.clone()).collect::<Vec<_>>()
         });
 
-        if !missed_keys.is_empty() {
+        if !sync_source_keys.is_empty() {
             let mut missed_entries = match *self.loader {
                 Loader::SingleLoader(_) => Self::source_by_sloader(
-                    &missed_keys,
+                    &sync_source_keys,
                     self.loader.clone(),
                     self.sfg.clone(),
                     self.cache_store.clone(),
@@ -372,8 +397,9 @@ where
                     }
                 })?,
                 Loader::MultiLoader(_) => {
-                    let missed_key_vector =
-                        missed_keys.chunks(self.max_batch_size).collect::<Vec<_>>();
+                    let missed_key_vector = sync_source_keys
+                        .chunks(self.max_batch_size)
+                        .collect::<Vec<_>>();
 
                     let mut entries: Vec<Entry<K, V>> = Vec::with_capacity(keys.len());
                     for keys in missed_key_vector.into_iter() {
@@ -482,7 +508,7 @@ where
             .collect())
     }
 
-    pub async fn mset(&mut self, kvs: &[(K, V)]) -> Result<()> {
+    pub async fn mset(&self, kvs: &[(K, V)]) -> Result<()> {
         let kvs = kvs
             .iter()
             .map(|kv| {
@@ -491,9 +517,10 @@ where
                     Entry {
                         key: kv.0.clone(),
                         value: Some(kv.1.clone()),
-                        expire_at_ms: (Utc::now()
-                            + chrono::Duration::from_std(self.expire_time).unwrap())
-                        .timestamp_millis(),
+                        expire_at_ms: Some(
+                            (Utc::now() + chrono::Duration::from_std(self.expire_time).unwrap())
+                                .timestamp_millis(),
+                        ),
                     },
                 )
             })
@@ -504,8 +531,29 @@ where
         Ok(())
     }
 
-    pub async fn mdel(&mut self, keys: &[K]) -> Result<()> {
+    pub async fn mdel(&self, keys: &[K]) -> Result<()> {
         self.cache_store.mdel(keys).await
+    }
+
+    pub async fn refresh(&self, keys: &[K]) -> Result<()> {
+        if self.input.load().is_none() {
+            bail!(AutoCacheError::Unsupported);
+        }
+
+        let keys_vector = keys.chunks(self.max_batch_size).collect::<Vec<_>>();
+        for keys in keys_vector.into_iter() {
+            self.input
+                .load()
+                .as_ref()
+                .unwrap()
+                .send(AsyncSourceTask {
+                    _crate_time: Utc::now(),
+                    keys: keys.to_vec(),
+                })
+                .await?;
+        }
+
+        Ok(())
     }
 }
 

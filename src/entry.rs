@@ -13,7 +13,7 @@ use crate::codec::Codec;
 pub struct Entry<K, V> {
     pub(crate) key: K,
     pub(crate) value: Option<V>,
-    pub(crate) expire_at_ms: i64,
+    pub(crate) expire_at_ms: Option<i64>,
 }
 
 pub trait EntryTrait<K> {
@@ -26,7 +26,13 @@ where
     K: Clone,
 {
     fn is_outdated(&self) -> bool {
-        Utc.timestamp_millis_opt(self.expire_at_ms).unwrap() < Utc::now()
+        if self.expire_at_ms.is_none() {
+            return false;
+        }
+
+        Utc.timestamp_millis_opt(self.expire_at_ms.unwrap())
+            .unwrap()
+            < Utc::now()
     }
 
     fn get_key(&self) -> K {
@@ -85,5 +91,5 @@ where
 struct EntryInner<K> {
     key: K,
     value_data: Vec<u8>,
-    expire_at_ms: i64,
+    expire_at_ms: Option<i64>,
 }
