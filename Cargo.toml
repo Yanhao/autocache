@@ -12,20 +12,29 @@ keywords = ["cache"]
 [dependencies]
 thiserror = "1"
 anyhow = "1"
-bytes = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 chrono = "0.4.26"
 parking_lot = "0.12"
 async_singleflight = "0.5"
-redis = { version = "0.23", features = ["tokio-comp"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
-im = "15"
-moka = { version =  "0.12", features = [ "sync" ] }
 derivative = "2"
 arc-swap = "1.6"
 tracing = "0.1"
 
+bytes = { version = "1", optional = true }
+redis = { version = "0.23", features = ["tokio-comp"], optional = true }
+im = { version = "15", optional = true }
+serde = { version = "1", features = ["derive"], optional= true }
+moka = { version =  "0.12", features = [ "sync" ], optional = true }
+serde_json = { version = "1", optional= true }
+
 [dev-dependencies]
 tracing-subscriber = "0.3"
+
+[features]
+default = [ "localcache" ]
+serilize = [ "dep:serde", "dep:serde_json" ]
+localcache = [ "dep:moka" ]
+ttlcache = [ "dep:im" ]
+rediscache = [ "serilize", "dep:redis" ]
+twolevelcache = [ "serilize" ]

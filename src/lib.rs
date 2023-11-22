@@ -7,13 +7,18 @@
 mod autocache;
 mod builder;
 mod cache;
+#[cfg(feature = "serilize")]
 mod codec;
 mod entry;
 mod error;
 mod loader;
+#[cfg(feature = "localcache")]
 pub mod local_cache;
+#[cfg(feature = "rediscache")]
 pub mod redis_cache;
+#[cfg(feature = "ttlcache")]
 pub mod ttl_cache;
+#[cfg(feature = "twolevelcache")]
 pub mod twolevel_cache;
 
 #[cfg(test)]
@@ -22,5 +27,8 @@ mod test;
 pub use autocache::AutoCache;
 pub use builder::AutoCacheBuilder;
 pub use cache::Cache;
+#[cfg(feature = "serilize")]
 pub use codec::Codec;
-pub use entry::{Entry, EntryTrait, SerilizableEntryTrait};
+pub use entry::{Entry, EntryTrait};
+#[cfg(feature = "serilize")]
+pub use entry::SerilizableEntryTrait;

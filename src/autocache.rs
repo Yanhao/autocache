@@ -2,7 +2,7 @@ use std::{fmt::Debug, sync::Arc};
 
 use anyhow::Result;
 use arc_swap::ArcSwapOption;
-use chrono::{prelude::*, Duration};
+use chrono::prelude::*;
 use tracing::{debug, error};
 
 use crate::{
@@ -165,7 +165,7 @@ where
             let entry = Entry {
                 key: key.clone(),
                 value,
-                expire_at_ms: (Utc::now() + Duration::from_std(expire_time).unwrap())
+                expire_at_ms: (Utc::now() + chrono::Duration::from_std(expire_time).unwrap())
                     .timestamp_millis(),
             };
 
@@ -232,7 +232,7 @@ where
                                 key: kv.0.clone(),
                                 value: Some(kv.1.clone()),
                                 expire_at_ms: (Utc::now()
-                                    + Duration::from_std(expire_time).unwrap())
+                                    + chrono::Duration::from_std(expire_time).unwrap())
                                 .timestamp_millis(),
                             },
                         ));
@@ -245,7 +245,7 @@ where
                             key: k.clone(),
                             value: None,
                             expire_at_ms: (Utc::now()
-                                + Duration::from_std(none_value_expire_time).unwrap())
+                                + chrono::Duration::from_std(none_value_expire_time).unwrap())
                             .timestamp_millis(),
                         },
                     )
@@ -491,8 +491,9 @@ where
                     Entry {
                         key: kv.0.clone(),
                         value: Some(kv.1.clone()),
-                        expire_at_ms: (Utc::now() + Duration::from_std(self.expire_time).unwrap())
-                            .timestamp_millis(),
+                        expire_at_ms: (Utc::now()
+                            + chrono::Duration::from_std(self.expire_time).unwrap())
+                        .timestamp_millis(),
                     },
                 )
             })

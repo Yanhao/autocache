@@ -1,9 +1,12 @@
 use std::fmt::Debug;
 
+#[cfg(feature = "serilize")]
 use bytes::Buf;
 use chrono::prelude::*;
+#[cfg(feature = "serilize")]
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+#[cfg(feature = "serilize")]
 use crate::codec::Codec;
 
 #[derive(Debug, Clone)]
@@ -31,6 +34,7 @@ where
     }
 }
 
+#[cfg(feature = "serilize")]
 pub trait SerilizableEntryTrait {
     fn decode(data: bytes::Bytes) -> anyhow::Result<Self>
     where
@@ -38,6 +42,7 @@ pub trait SerilizableEntryTrait {
     fn encode(&self) -> anyhow::Result<bytes::Bytes>;
 }
 
+#[cfg(feature = "serilize")]
 impl<K, V> SerilizableEntryTrait for Entry<K, V>
 where
     K: Serialize + DeserializeOwned + Clone,
@@ -75,6 +80,7 @@ where
     }
 }
 
+#[cfg(feature = "serilize")]
 #[derive(Serialize, Deserialize)]
 struct EntryInner<K> {
     key: K,
