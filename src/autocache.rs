@@ -35,7 +35,7 @@ where
     pub(crate) use_expired_data: bool, // means async source
     pub(crate) manually_refresh: bool,
 
-    pub(crate) input: ArcSwapOption<tokio::sync::mpsc::Sender<AsyncSourceTask<K>>>,
+    pub(crate) async_refresh_channel: ArcSwapOption<tokio::sync::mpsc::Sender<AsyncSourceTask<K>>>,
     pub(crate) stop_ch: Option<tokio::sync::mpsc::Sender<()>>,
 
     pub(crate) on_metrics:
@@ -57,7 +57,7 @@ where
         self.stop_ch.replace(tx);
 
         let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(512);
-        self.input.store(Some(Arc::new(input_tx)));
+        self.async_refresh_channel.store(Some(Arc::new(input_tx)));
 
         let loader = self.loader.clone();
         let cache = self.cache_store.clone();
@@ -306,21 +306,7 @@ where
                 .filter_map(|e| e.is_outdated().then(|| e.key.clone()))
                 .collect::<Vec<_>>();
 
-            let keys_vector = expired_keys.chunks(self.max_batch_size).collect::<Vec<_>>();
-
-            for keys in keys_vector.into_iter() {
-                if let Some(input) = self.input.load().as_ref() {
-                    let _ = input
-                        .send(AsyncSourceTask {
-                            _crate_time: Utc::now(),
-                            keys: keys.to_vec(),
-                        })
-                        .await
-                        .inspect_err(|e| {
-                            error!("autocache: send async source task failed!, error: {e}")
-                        });
-                }
-            }
+            let _ = self.refresh(&expired_keys).await;
         }
     }
 
@@ -536,13 +522,14 @@ where
     }
 
     pub async fn refresh(&self, keys: &[K]) -> Result<()> {
-        if self.input.load().is_none() {
+        if self.async_refresh_channel.load().is_none() {
             bail!(AutoCacheError::Unsupported);
         }
 
         let keys_vector = keys.chunks(self.max_batch_size).collect::<Vec<_>>();
         for keys in keys_vector.into_iter() {
-            self.input
+            let _ = self
+                .async_refresh_channel
                 .load()
                 .as_ref()
                 .unwrap()
@@ -550,7 +537,8 @@ where
                     _crate_time: Utc::now(),
                     keys: keys.to_vec(),
                 })
-                .await?;
+                .await
+                .inspect_err(|e| error!("autocache: send async source task failed!, error: {e}"));
         }
 
         Ok(())

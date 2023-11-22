@@ -146,7 +146,7 @@ where
             sfg: Arc::new(async_singleflight::Group::new()),
             mfg: Arc::new(async_singleflight::Group::new()),
 
-            input: None.into(),
+            async_refresh_channel: None.into(),
             stop_ch: None,
 
             on_metrics: self.on_metrics,
