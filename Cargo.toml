@@ -34,7 +34,7 @@ tracing-subscriber = "0.3"
 
 [features]
 default = [ "localcache" ]
-serilize = [ "dep:serde", "dep:serde_json" ]
+serilize = [ "dep:serde", "dep:serde_json", "dep:bytes" ]
 localcache = [ "dep:moka" ]
 ttlcache = [ "dep:im" ]
 rediscache = [ "serilize", "dep:redis" ]
