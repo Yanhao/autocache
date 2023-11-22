@@ -77,4 +77,8 @@ where
     fn name(&self) -> &'static str {
         "twolevelcache"
     }
+
+    fn set_ns(&self, ns: String) {
+        self.redis_cache.set_ns(ns);
+    }
 }

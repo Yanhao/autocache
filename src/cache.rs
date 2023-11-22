@@ -15,4 +15,5 @@ pub trait Cache {
     async fn mdel(&self, keys: &[Self::Key]) -> Result<()>;
 
     fn name(&self) -> &'static str;
+    fn set_ns(&self, _ns: String) {}
 }

@@ -133,7 +133,7 @@ where
         let mut ac = AutoCache::<K, V, C> {
             cache_store: Arc::new(self.cache.unwrap()),
             loader: Arc::new(self.loader.unwrap()),
-            namespace: self.namespace,
+            namespace: self.namespace.clone(),
             cache_none: self.cache_none,
             expire_time: self.expire_time,
             none_value_expire_time: self.none_value_expire_time,
@@ -151,6 +151,10 @@ where
 
             on_metrics: self.on_metrics,
         };
+
+        if let Some(ns) = self.namespace.as_ref() {
+            ac.cache_store.set_ns(ns.clone());
+        }
 
         if ac.use_expired_data || ac.manually_refresh {
             ac.start().unwrap();

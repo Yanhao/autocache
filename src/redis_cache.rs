@@ -1,10 +1,15 @@
+use std::sync::Arc;
+
 use anyhow::Result;
+use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use redis::AsyncCommands;
 
 use crate::{cache::Cache, SerilizableEntryTrait};
 
 pub struct RedisCache<K, V> {
+    namespace: ArcSwapOption<String>,
+
     redis_cli: redis::Client,
 
     _m1: std::marker::PhantomData<K>,
@@ -14,6 +19,8 @@ pub struct RedisCache<K, V> {
 impl<K, V> RedisCache<K, V> {
     pub fn new(cli: redis::Client) -> Self {
         Self {
+            namespace: None.into(),
+
             redis_cli: cli,
             _m1: std::marker::PhantomData,
             _m2: std::marker::PhantomData,
@@ -82,5 +89,9 @@ where
 
     fn name(&self) -> &'static str {
         "rediscache"
+    }
+
+    fn set_ns(&self, ns: String) {
+        self.namespace.store(Some(Arc::new(ns)));
     }
 }
