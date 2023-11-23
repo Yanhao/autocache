@@ -2,7 +2,6 @@
 #![feature(async_closure)]
 #![feature(type_alias_impl_trait)]
 #![feature(associated_type_defaults)]
-#![feature(result_option_inspect)]
 
 mod autocache;
 mod builder;
