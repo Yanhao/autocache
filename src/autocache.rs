@@ -137,7 +137,7 @@ where
 
             if err.is_some() {
                 error!(msg = "autocache: single source failed", error = ?err, key = ?key);
-                anyhow::bail!("single flight error");
+                anyhow::bail!(AutoCacheError::SingleFlight);
             }
             if value.is_none() {} // FIXME:
             let value = value.unwrap();
@@ -212,7 +212,7 @@ where
             .await;
 
         if err.is_some() {
-            anyhow::bail!("single flight error");
+            anyhow::bail!(AutoCacheError::SingleFlight);
         }
 
         let kvs = kvs.unwrap();
