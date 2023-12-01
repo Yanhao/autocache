@@ -114,14 +114,6 @@ where
         Ok(())
     }
 
-    pub async fn stop(&self) -> Result<()> {
-        if let Some(s) = self.stop_ch.as_ref() {
-            s.send(()).await?;
-        }
-
-        Ok(())
-    }
-
     async fn source_by_sloader(
         keys: &[K],
         loader: Arc<Loader<K, V>>,
@@ -545,6 +537,31 @@ where
     }
 }
 
+impl<K, V, C> Drop for AutoCache<K, V, C>
+where
+    K: Clone,
+    V: Clone,
+    C: Cache<Key = K, Value = Entry<K, V>>,
+{
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+impl<K, V, C> AutoCache<K, V, C>
+where
+    K: Clone,
+    V: Clone,
+    C: Cache<Key = K, Value = Entry<K, V>>,
+{
+    fn stop(&self) -> Result<()> {
+        if let Some(s) = self.stop_ch.as_ref() {
+            s.try_send(())?;
+        }
+
+        Ok(())
+    }
+}
 pub(crate) struct AsyncSourceTask<T> {
     _crate_time: chrono::DateTime<Utc>,
     keys: Vec<T>,
