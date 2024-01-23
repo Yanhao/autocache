@@ -95,7 +95,7 @@ where
                             }
                             Loader::MultiLoader(_) => {
                                 Self::source_by_mloader(
-                                    &t.keys,
+                                    t.keys,
                                     loader.clone(),
                                     mfg.clone(),
                                     cache.clone(),
@@ -189,7 +189,7 @@ where
     }
 
     async fn source_by_mloader(
-        keys: &[K],
+        keys: Vec<K>,
         loader: Arc<Loader<K, V>>,
         mfg: Arc<async_singleflight::Group<Vec<(K, V)>, anyhow::Error>>,
         cache: Arc<C>,
@@ -209,7 +209,7 @@ where
         };
 
         let (kvs, err, _owner) = mfg
-            .work(&sfg_key, (|| async { (mloader)(&keys).await })())
+            .work(&sfg_key, (|| async { (mloader)(keys.clone()).await })())
             .await;
 
         if err.is_some() {
@@ -384,7 +384,7 @@ where
                     for keys in missed_key_vector.into_iter() {
                         entries.append(
                             &mut Self::source_by_mloader(
-                                keys,
+                                keys.to_vec(),
                                 self.loader.clone(),
                                 self.mfg.clone(),
                                 self.cache_store.clone(),
@@ -448,7 +448,7 @@ where
                 for keys in missed_key_vector.into_iter() {
                     entries.append(
                         &mut Self::source_by_mloader(
-                            keys,
+                            keys.to_vec(),
                             self.loader.clone(),
                             self.mfg.clone(),
                             self.cache_store.clone(),

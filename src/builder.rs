@@ -70,7 +70,7 @@ where
 
     pub fn multi_loader(
         mut self,
-        l: impl Fn(&[K]) -> BoxFuture<'static, Result<Vec<(K, V)>>> + 'static + Send + Sync,
+        l: impl Fn(Vec<K>) -> BoxFuture<'static, Result<Vec<(K, V)>>> + 'static + Send + Sync,
     ) -> Self {
         self.loader = Some(Loader::MultiLoader(Box::new(l)));
         self
