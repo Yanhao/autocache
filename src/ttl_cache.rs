@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
+use arc_swap::ArcSwapOption;
 use chrono::prelude::*;
 use futures::future::BoxFuture;
 
@@ -28,9 +29,10 @@ pub struct TtlCache<K, V> {
     data: Arc<parking_lot::RwLock<im::OrdMap<K, CacheItem<V>>>>,
 
     ttl: Option<std::time::Duration>,
-    expire_listener: Arc<Option<Box<dyn Fn(Vec<K>) -> BoxFuture<'static, ()> + Send + Sync>>>,
+    expire_listener:
+        ArcSwapOption<Box<dyn Fn(Vec<(K, V)>) -> BoxFuture<'static, ()> + Send + Sync>>,
 
-    stop_notifier: Option<Arc<tokio::sync::Notify>>,
+    stop_notifier: ArcSwapOption<tokio::sync::Notify>,
 }
 
 impl<K, V> TtlCache<K, V> {
@@ -38,23 +40,37 @@ impl<K, V> TtlCache<K, V> {
         Self {
             data: Arc::new(parking_lot::RwLock::new(im::OrdMap::new())),
             ttl,
-            expire_listener: Arc::new(None),
+            expire_listener: None.into(),
 
-            stop_notifier: None,
+            stop_notifier: None.into(),
         }
     }
 
     pub fn new_with_expire_listener(
         ttl: Option<std::time::Duration>,
-        listener: impl Fn(Vec<K>) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+        listener: impl Fn(Vec<(K, V)>) -> BoxFuture<'static, ()> + Send + Sync + 'static,
     ) -> Self {
         Self {
             data: Arc::new(parking_lot::RwLock::new(im::OrdMap::new())),
             ttl,
-            expire_listener: Arc::new(Some(Box::new(listener))),
+            expire_listener: ArcSwapOption::new(Some(Arc::new(Box::new(listener)))),
 
-            stop_notifier: None,
+            stop_notifier: None.into(),
         }
+    }
+
+    pub fn set_expire_listener(
+        &self,
+        listener: impl Fn(Vec<(K, V)>) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    ) -> Result<()> {
+        if self.stop_notifier.load().is_some() {
+            bail!("expire listener already set");
+        }
+
+        self.expire_listener
+            .store(Some(Arc::new(Box::new(listener))));
+
+        Ok(())
     }
 }
 
@@ -110,34 +126,25 @@ where
 {
     async fn check_expires(
         cache: Arc<parking_lot::RwLock<im::OrdMap<K, CacheItem<V>>>>,
-        expire_listener: Arc<Option<Box<dyn Fn(Vec<K>) -> BoxFuture<'static, ()> + Send + Sync>>>,
+        expire_listener: Arc<Box<dyn Fn(Vec<(K, V)>) -> BoxFuture<'static, ()> + Send + Sync>>,
     ) {
-        if expire_listener.is_none() {
-            return;
-        }
-
         let cache_snap = cache.read().clone();
 
         let mut expires = Vec::with_capacity(128);
 
         for (key, ci) in cache_snap.iter() {
             if ci.value.is_outdated() {
-                expires.push(key.clone());
+                expires.push((key.clone(), ci.value.clone()));
 
                 if expires.len() == 100 {
-                    if let Some(l) = expire_listener.as_ref().as_ref() {
-                        l(expires.clone()).await;
-                    }
-
+                    expire_listener(expires.clone()).await;
                     expires.clear();
                 }
             }
         }
 
         if !expires.is_empty() {
-            if let Some(l) = expire_listener.as_ref().as_ref() {
-                l(expires.clone()).await;
-            }
+            expire_listener(expires.clone()).await;
         }
     }
 
@@ -161,20 +168,22 @@ where
         }
     }
 
-    pub fn start(&mut self) -> Result<()> {
-        if self.stop_notifier.is_some() {
+    pub fn start(&self) -> Result<()> {
+        if self.stop_notifier.load().is_some() {
             return Ok(());
         }
 
+        let Some(listener) = self.expire_listener.load().clone() else {
+            bail!("expire listener is none");
+        };
+
         let notifier = Arc::new(tokio::sync::Notify::new());
-        self.stop_notifier.replace(notifier.clone());
+        self.stop_notifier.store(Some(notifier.clone()));
 
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let cache = self.data.clone();
-        let listener = self.expire_listener.clone();
-
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -194,7 +203,7 @@ where
     }
 
     pub fn stop(&self) -> Result<()> {
-        if let Some(s) = self.stop_notifier.as_ref() {
+        if let Some(s) = self.stop_notifier.load().as_ref() {
             s.notify_one();
         }
 
