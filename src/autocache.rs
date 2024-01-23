@@ -3,6 +3,7 @@ use std::{fmt::Debug, sync::Arc};
 use anyhow::{bail, Result};
 use arc_swap::ArcSwapOption;
 use chrono::prelude::*;
+use futures::future::BoxFuture;
 use tracing::{debug, error};
 
 use crate::{
@@ -534,6 +535,13 @@ where
         }
 
         Ok(())
+    }
+
+    pub async fn with_cache<T>(
+        &self,
+        op: impl FnOnce(Arc<C>) -> BoxFuture<'static, Result<T>> + Send,
+    ) -> Result<T> {
+        op(self.cache_store.clone()).await
     }
 }
 
