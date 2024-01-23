@@ -33,12 +33,8 @@ where
     K: Sync + AsRef<str>,
 {
     fn generate_redis_key(&self, k: K) -> String {
-        if self.namespace.load().is_none() {
-            return k.as_ref().to_string();
-        }
-
         if let Some(ns) = self.namespace.load().as_ref() {
-            if ns == "" {
+            if ns.as_ref() == "" {
                 return k.as_ref().to_string();
             }
 
@@ -49,13 +45,15 @@ where
             key.push_str(k.as_ref());
 
             return key;
+        } else {
+            return k.as_ref().to_string();
         }
     }
 }
 
 impl<K, V> Cache for RedisCache<K, V>
 where
-    K: Sync + AsRef<str>,
+    K: Clone + Sync + AsRef<str>,
     V: Sync + SerilizableEntryTrait,
 {
     type Key = K;
@@ -66,7 +64,7 @@ where
 
         if keys.len() == 1 {
             let key = keys.get(0).unwrap();
-            let data: bytes::Bytes = conn.get(&self.generate_redis_key(key.as_ref())).await?;
+            let data: bytes::Bytes = conn.get(&self.generate_redis_key(key.clone())).await?;
 
             let value: V = V::decode(data)?;
 
@@ -76,7 +74,7 @@ where
         let res: Vec<Option<Bytes>> = conn
             .mget(
                 keys.iter()
-                    .map(|k| &self.generate_redis_key(key.as_ref()))
+                    .map(|k| self.generate_redis_key(k.clone()))
                     .collect::<Vec<_>>(),
             )
             .await?;
@@ -93,7 +91,7 @@ where
         if kvs.len() == 1 {
             let kv = kvs.get(0).unwrap();
             conn.set(
-                &self.generate_redis_key(kv.0.as_ref()),
+                &self.generate_redis_key(kv.0.clone()),
                 kv.1.encode().unwrap().to_vec(),
             )
             .await?;
@@ -105,7 +103,7 @@ where
             &kvs.iter()
                 .map(|(key, value)| {
                     (
-                        &self.generate_redis_key(key.as_ref()),
+                        self.generate_redis_key(key.clone()),
                         value.encode().unwrap().to_vec(),
                     )
                 })
@@ -120,7 +118,7 @@ where
         let mut conn = self.redis_cli.get_async_connection().await?;
         conn.del(
             keys.iter()
-                .map(|key| &self.generate_redis_key(key.as_ref()))
+                .map(|key| self.generate_redis_key(key.clone()))
                 .collect::<Vec<_>>(),
         )
         .await?;

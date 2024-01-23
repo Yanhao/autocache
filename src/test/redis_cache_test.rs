@@ -21,7 +21,7 @@ async fn test_redis_cache() {
         .cache(RedisCache::new(redis_cli))
         .expire_time(std::time::Duration::from_secs(10))
         .use_expired_data(true)
-        .single_loader(|key: String| {
+        .single_loader(|key: String, ()| {
             async move {
                 Ok(Some(Item {
                     count: 1,
@@ -32,6 +32,6 @@ async fn test_redis_cache() {
         })
         .build();
 
-    let v1 = ac.mget(&["test-key1".to_string()]).await.unwrap();
+    let v1 = ac.mget(&[("test-key1".to_string(), ())]).await.unwrap();
     dbg!(&v1);
 }

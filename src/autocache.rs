@@ -14,14 +14,14 @@ use crate::{
     loader::Loader,
 };
 
-pub struct AutoCache<K, V, C>
+pub struct AutoCache<K, V, C, E>
 where
     K: Clone,
     V: Clone,
     C: Cache<Key = K, Value = Entry<K, V>>,
 {
     pub(crate) cache_store: Arc<C>,
-    pub(crate) loader: Arc<Loader<K, V>>,
+    pub(crate) loader: Arc<Loader<K, V, E>>,
 
     pub(crate) sfg: Arc<async_singleflight::Group<Option<V>, anyhow::Error>>,
     pub(crate) mfg: Arc<async_singleflight::Group<Vec<(K, V)>, anyhow::Error>>,
@@ -36,20 +36,22 @@ where
     pub(crate) use_expired_data: bool, // means async source
     pub(crate) manually_refresh: bool,
 
-    pub(crate) async_refresh_channel: ArcSwapOption<tokio::sync::mpsc::Sender<AsyncSourceTask<K>>>,
+    pub(crate) async_refresh_channel:
+        ArcSwapOption<tokio::sync::mpsc::Sender<AsyncSourceTask<K, E>>>,
     pub(crate) stop_ch: Option<tokio::sync::mpsc::Sender<()>>,
 
     pub(crate) on_metrics:
         Option<fn(method: &str, is_error: bool, ns: &str, from: &str, cache_name: &str)>,
 }
 
-impl<K, V, C> AutoCache<K, V, C>
+impl<K, V, C, E> AutoCache<K, V, C, E>
 where
     K: Clone + Debug + PartialEq + AsRef<str> + Sync + Send + 'static,
     V: Clone + Debug + Sync + Send + 'static,
     C: Cache<Key = K, Value = Entry<K, V>> + Sync + Send + 'static,
+    E: Clone + Debug + Sync + Send + 'static,
 {
-    pub fn builder() -> AutoCacheBuilder<K, V, C> {
+    pub fn builder() -> AutoCacheBuilder<K, V, C, E> {
         AutoCacheBuilder::new()
     }
 
@@ -116,8 +118,8 @@ where
     }
 
     async fn source_by_sloader(
-        keys: &[K],
-        loader: Arc<Loader<K, V>>,
+        keys: &[(K, E)],
+        loader: Arc<Loader<K, V, E>>,
         sfg: Arc<async_singleflight::Group<Option<V>, anyhow::Error>>,
         cache: Arc<C>,
         cache_none: bool,
@@ -125,15 +127,18 @@ where
         none_value_expire_time: std::time::Duration,
         async_set_cache: bool,
     ) -> Result<Vec<Entry<K, V>>> {
-        let Loader::<K, V>::SingleLoader(ref sloader) = *loader else {
+        let Loader::<K, V, E>::SingleLoader(ref sloader) = *loader else {
             unreachable!();
         };
 
         let mut ret = Vec::with_capacity(keys.len());
 
-        for key in keys.iter() {
+        for (key, extra) in keys.iter() {
             let (value, err, _owner) = sfg
-                .work(key.as_ref(), (|| async { (sloader)(key.clone()).await })())
+                .work(
+                    key.as_ref(),
+                    (|| async { (sloader)(key.clone(), extra.clone()).await })(),
+                )
                 .await;
 
             if err.is_some() {
@@ -189,8 +194,8 @@ where
     }
 
     async fn source_by_mloader(
-        keys: Vec<K>,
-        loader: Arc<Loader<K, V>>,
+        keys: Vec<(K, E)>,
+        loader: Arc<Loader<K, V, E>>,
         mfg: Arc<async_singleflight::Group<Vec<(K, V)>, anyhow::Error>>,
         cache: Arc<C>,
         cache_none: bool,
@@ -198,12 +203,12 @@ where
         none_value_expire_time: std::time::Duration,
         async_set_cache: bool,
     ) -> Result<Vec<Entry<K, V>>> {
-        let Loader::<K, V>::MultiLoader(ref mloader) = *loader else {
+        let Loader::<K, V, E>::MultiLoader(ref mloader) = *loader else {
             unreachable!();
         };
 
         let sfg_key = {
-            let mut a = keys.iter().map(|k| k.as_ref()).collect::<Vec<_>>();
+            let mut a = keys.iter().map(|k| k.0.as_ref()).collect::<Vec<_>>();
             a.sort();
             a.join(",")
         };
@@ -222,7 +227,7 @@ where
             .iter()
             .filter_map(|k| {
                 for kv in kvs.iter() {
-                    if &kv.0 == k {
+                    if &kv.0 == &k.0 {
                         return Some((
                             kv.0.clone(),
                             Entry {
@@ -238,9 +243,9 @@ where
                 }
                 cache_none.then(|| {
                     (
-                        k.clone(),
+                        k.0.clone(),
                         Entry {
-                            key: k.clone(),
+                            key: k.0.clone(),
                             value: None,
                             expire_at_ms: Some(
                                 (Utc::now()
@@ -268,12 +273,16 @@ where
         Ok(key_entries.into_iter().map(|(_, e)| e).collect::<Vec<_>>())
     }
 
-    async fn filter_sync_source_keys(&self, keys: &[K], entries: &[Entry<K, V>]) -> Vec<K> {
+    async fn filter_sync_source_keys(
+        &self,
+        keys: &[(K, E)],
+        entries: &[Entry<K, V>],
+    ) -> Vec<(K, E)> {
         let sync_source_keys = keys
             .iter()
             .filter_map(|key| {
                 for ent in entries.iter() {
-                    if &ent.key == key {
+                    if &ent.key == &key.0 {
                         if !ent.is_outdated() {
                             return None;
                         }
@@ -292,20 +301,33 @@ where
         sync_source_keys
     }
 
-    async fn check_and_async_source(&self, entries: &[Entry<K, V>]) {
+    async fn check_and_async_source(&self, entries: &[Entry<K, V>], keys: &[(K, E)]) {
         if self.use_expired_data && !self.manually_refresh {
             let expired_keys = entries
                 .iter()
                 .filter_map(|e| e.is_outdated().then(|| e.key.clone()))
                 .collect::<Vec<_>>();
 
-            let _ = self.refresh(&expired_keys).await;
+            let _ = self
+                .refresh(
+                    &keys
+                        .iter()
+                        .filter_map(|k| {
+                            if expired_keys.contains(&k.0) {
+                                Some(k.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .await;
         }
     }
 
     async fn filter_unexpired_entry(
         &self,
-        sync_source_keys: &[K],
+        sync_source_keys: &[(K, E)],
         entries: Vec<Entry<K, V>>,
     ) -> Vec<Entry<K, V>> {
         entries
@@ -316,7 +338,7 @@ where
                 }
 
                 for key in sync_source_keys.iter() {
-                    if &ent.key == key {
+                    if &ent.key == &key.0 {
                         return None;
                     }
                 }
@@ -326,19 +348,27 @@ where
             .collect::<Vec<_>>()
     }
 
-    pub async fn mget(&self, keys: &[K]) -> Result<Vec<(K, V)>> {
+    pub async fn mget(&self, keys: &[(K, E)]) -> Result<Vec<(K, V)>> {
         if self.source_first {
             return self.mget_with_source_first(keys).await;
         }
 
         let mut from = "-";
-        let entries = self.cache_store.mget(keys).await?;
+        let entries = self
+            .cache_store
+            .mget(
+                &keys
+                    .into_iter()
+                    .map(|key| key.0.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
         debug!(msg = "autocache: mget from cache before filter", keys = ?keys, ret = ?{
             entries.iter().map(|e| e.key.clone()).collect::<Vec<_>>()
         });
 
         let sync_source_keys = self.filter_sync_source_keys(keys, &entries).await;
-        self.check_and_async_source(&entries).await;
+        self.check_and_async_source(&entries, keys).await;
 
         let mut entries = self
             .filter_unexpired_entry(&sync_source_keys, entries)
@@ -426,7 +456,7 @@ where
             .collect())
     }
 
-    async fn mget_with_source_first(&self, keys: &[K]) -> Result<Vec<(K, V)>> {
+    async fn mget_with_source_first(&self, keys: &[(K, E)]) -> Result<Vec<(K, V)>> {
         let mut entries = match *self.loader {
             Loader::SingleLoader(_) => {
                 Self::source_by_sloader(
@@ -469,11 +499,11 @@ where
             .iter()
             .filter_map(|k| {
                 for e in entries.iter() {
-                    if &e.key == k {
+                    if &e.key == &k.0 {
                         return None;
                     }
                 }
-                return Some(k.clone());
+                return Some(k.0.clone());
             })
             .collect::<Vec<_>>();
 
@@ -514,7 +544,7 @@ where
         self.cache_store.mdel(keys).await
     }
 
-    pub async fn refresh(&self, keys: &[K]) -> Result<()> {
+    pub async fn refresh(&self, keys: &[(K, E)]) -> Result<()> {
         if self.async_refresh_channel.load().is_none() {
             bail!(AutoCacheError::Unsupported);
         }
@@ -545,7 +575,7 @@ where
     }
 }
 
-impl<K, V, C> Drop for AutoCache<K, V, C>
+impl<K, V, C, E> Drop for AutoCache<K, V, C, E>
 where
     K: Clone,
     V: Clone,
@@ -556,7 +586,7 @@ where
     }
 }
 
-impl<K, V, C> AutoCache<K, V, C>
+impl<K, V, C, E> AutoCache<K, V, C, E>
 where
     K: Clone,
     V: Clone,
@@ -570,7 +600,7 @@ where
         Ok(())
     }
 }
-pub(crate) struct AsyncSourceTask<T> {
+pub(crate) struct AsyncSourceTask<K, E> {
     _crate_time: chrono::DateTime<Utc>,
-    keys: Vec<T>,
+    keys: Vec<(K, E)>,
 }

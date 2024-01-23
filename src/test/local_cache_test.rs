@@ -27,7 +27,7 @@ async fn test_builder() {
         .expire_time(std::time::Duration::from_secs(10))
         .use_expired_data(true)
         .on_metrics(on_metrics)
-        .single_loader(|key: String| {
+        .single_loader(|key: String, ()| {
             async move {
                 dbg!(&key);
                 if key == "test-key4" {
@@ -43,7 +43,7 @@ async fn test_builder() {
         })
         .build();
 
-    let v1 = ac.mget(&["test-key1".to_string()]).await.unwrap();
+    let v1 = ac.mget(&[("test-key1".to_string(), ())]).await.unwrap();
     dbg!(&v1);
     // assert_eq!(v1.len(), 1);
     // assert_eq!(

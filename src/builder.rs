@@ -6,14 +6,14 @@ use futures::future::BoxFuture;
 
 use crate::{autocache::AutoCache, cache::Cache, entry::Entry, loader::Loader};
 
-pub struct AutoCacheBuilder<K, V, C>
+pub struct AutoCacheBuilder<K, V, C, E>
 where
     K: Clone,
     V: Clone,
     C: Cache<Key = K, Value = Entry<K, V>>,
 {
     pub(crate) cache: Option<C>,
-    pub(crate) loader: Option<Loader<K, V>>,
+    pub(crate) loader: Option<Loader<K, V, E>>,
 
     pub(crate) cache_none: bool,
     pub(crate) expire_time: std::time::Duration,
@@ -30,11 +30,12 @@ where
         Option<fn(method: &str, is_error: bool, ns: &str, from: &str, cache_name: &str)>,
 }
 
-impl<K, V, C> AutoCacheBuilder<K, V, C>
+impl<K, V, C, E> AutoCacheBuilder<K, V, C, E>
 where
     K: Clone + Debug + PartialEq + AsRef<str> + Sync + Send + 'static,
     V: Clone + Debug + Sync + Send + 'static,
     C: Cache<Key = K, Value = Entry<K, V>> + Sync + Send + 'static,
+    E: Clone + Debug + Sync + Send + 'static,
 {
     pub fn new() -> Self {
         Self {
@@ -62,7 +63,7 @@ where
 
     pub fn single_loader(
         mut self,
-        l: impl Fn(K) -> BoxFuture<'static, Result<Option<V>>> + 'static + Send + Sync,
+        l: impl Fn(K, E) -> BoxFuture<'static, Result<Option<V>>> + 'static + Send + Sync,
     ) -> Self {
         self.loader = Some(Loader::SingleLoader(Box::new(l)));
         self
@@ -70,7 +71,7 @@ where
 
     pub fn multi_loader(
         mut self,
-        l: impl Fn(Vec<K>) -> BoxFuture<'static, Result<Vec<(K, V)>>> + 'static + Send + Sync,
+        l: impl Fn(Vec<(K, E)>) -> BoxFuture<'static, Result<Vec<(K, V)>>> + 'static + Send + Sync,
     ) -> Self {
         self.loader = Some(Loader::MultiLoader(Box::new(l)));
         self
@@ -129,8 +130,8 @@ where
         self
     }
 
-    pub fn build(self) -> AutoCache<K, V, C> {
-        let mut ac = AutoCache::<K, V, C> {
+    pub fn build(self) -> AutoCache<K, V, C, E> {
+        let mut ac = AutoCache::<K, V, C, E> {
             cache_store: Arc::new(self.cache.unwrap()),
             loader: Arc::new(self.loader.unwrap()),
             namespace: self.namespace.clone(),

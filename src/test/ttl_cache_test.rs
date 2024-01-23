@@ -6,15 +6,21 @@ use once_cell::sync::Lazy;
 
 use crate::{autocache::AutoCache, ttl_cache::TtlCache, Entry};
 
-static AC: Lazy<ArcSwapOption<AutoCache<String, String, TtlCache<String, Entry<String, String>>>>> =
-    Lazy::new(|| None.into());
+static AC: Lazy<
+    ArcSwapOption<AutoCache<String, String, TtlCache<String, Entry<String, String>>, ()>>,
+> = Lazy::new(|| None.into());
 
 #[tokio::test]
 async fn test_builder() {
-    let mut ttl_cache: TtlCache<String, _> =
-        TtlCache::new_with_expire_listener(None, |keys: Vec<String>| {
+    let ttl_cache: TtlCache<String, _> =
+        TtlCache::new_with_expire_listener(None, |keys: Vec<(String, _)>| {
             Box::pin(async move {
-                let _ = AC.load().as_ref().unwrap().refresh(&keys).await;
+                let _ = AC
+                    .load()
+                    .as_ref()
+                    .unwrap()
+                    .refresh(&keys.iter().map(|k| (k.0.clone(), ())).collect::<Vec<_>>())
+                    .await;
             })
             .boxed()
         });
@@ -24,7 +30,7 @@ async fn test_builder() {
         AutoCache::builder()
             .cache(ttl_cache)
             .expire_time(std::time::Duration::from_secs(60))
-            .single_loader(|key: String| async move { Ok(Some(key.clone())) }.boxed())
+            .single_loader(|key: String, ()| async move { Ok(Some(key.clone())) }.boxed())
             .build(),
     )));
 
@@ -32,7 +38,7 @@ async fn test_builder() {
         .load()
         .as_ref()
         .unwrap()
-        .mget(&[String::from("test-key1")])
+        .mget(&[(String::from("test-key1"), ())])
         .await
         .unwrap();
 
