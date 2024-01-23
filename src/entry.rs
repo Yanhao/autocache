@@ -11,9 +11,9 @@ use crate::codec::Codec;
 
 #[derive(Debug, Clone)]
 pub struct Entry<K, V> {
-    pub(crate) key: K,
-    pub(crate) value: Option<V>,
-    pub(crate) expire_at_ms: Option<i64>,
+    pub key: K,
+    pub value: Option<V>,
+    pub expire_at_ms: Option<i64>,
 }
 
 pub trait EntryTrait<K> {
