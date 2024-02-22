@@ -13,6 +13,7 @@ mod error;
 mod loader;
 #[cfg(feature = "localcache")]
 pub mod local_cache;
+mod options;
 #[cfg(feature = "rediscache")]
 pub mod redis_cache;
 #[cfg(feature = "ttlcache")]
@@ -28,6 +29,7 @@ pub use builder::AutoCacheBuilder;
 pub use cache::Cache;
 #[cfg(feature = "serilize")]
 pub use codec::Codec;
-pub use entry::{Entry, EntryTrait};
 #[cfg(feature = "serilize")]
 pub use entry::SerilizableEntryTrait;
+pub use entry::{Entry, EntryTrait};
+pub use options::Options;

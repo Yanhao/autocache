@@ -12,6 +12,7 @@ use crate::{
     entry::{Entry, EntryTrait},
     error::AutoCacheError,
     loader::Loader,
+    Options,
 };
 
 pub struct AutoCache<K, V, C, E>
@@ -277,6 +278,7 @@ where
         &self,
         keys: &[(K, E)],
         entries: &[Entry<K, V>],
+        use_expired_data: bool,
     ) -> Vec<(K, E)> {
         let sync_source_keys = keys
             .iter()
@@ -287,7 +289,7 @@ where
                             return None;
                         }
 
-                        if self.use_expired_data || self.manually_refresh {
+                        if use_expired_data || self.manually_refresh {
                             return None;
                         }
                     }
@@ -301,8 +303,13 @@ where
         sync_source_keys
     }
 
-    async fn check_and_async_source(&self, entries: &[Entry<K, V>], keys: &[(K, E)]) {
-        if self.use_expired_data && !self.manually_refresh {
+    async fn check_and_async_source(
+        &self,
+        entries: &[Entry<K, V>],
+        keys: &[(K, E)],
+        use_expired_data: bool,
+    ) {
+        if use_expired_data && !self.manually_refresh {
             let expired_keys = entries
                 .iter()
                 .filter_map(|e| e.is_outdated().then(|| e.key.clone()))
@@ -329,11 +336,12 @@ where
         &self,
         sync_source_keys: &[(K, E)],
         entries: Vec<Entry<K, V>>,
+        use_expired_data: bool,
     ) -> Vec<Entry<K, V>> {
         entries
             .into_iter()
             .filter_map(|ent| {
-                if ent.is_outdated() && !self.use_expired_data {
+                if ent.is_outdated() && !use_expired_data {
                     return None;
                 }
 
@@ -349,7 +357,14 @@ where
     }
 
     pub async fn mget(&self, keys: &[(K, E)]) -> Result<Vec<(K, V)>> {
-        if self.source_first {
+        self.mget_with_option(keys, Options::default()).await
+    }
+
+    pub async fn mget_with_option(&self, keys: &[(K, E)], options: Options) -> Result<Vec<(K, V)>> {
+        if options.source_first == Some(true) {
+            return self.mget_with_source_first(keys).await;
+        }
+        if self.source_first && options.source_first != Some(false) {
             return self.mget_with_source_first(keys).await;
         }
 
@@ -367,11 +382,35 @@ where
             entries.iter().map(|e| e.key.clone()).collect::<Vec<_>>()
         });
 
-        let sync_source_keys = self.filter_sync_source_keys(keys, &entries).await;
-        self.check_and_async_source(&entries, keys).await;
+        let sync_source_keys = self
+            .filter_sync_source_keys(
+                keys,
+                &entries,
+                match options.use_expired_data {
+                    Some(u) => u,
+                    None => self.use_expired_data,
+                },
+            )
+            .await;
+        self.check_and_async_source(
+            &entries,
+            keys,
+            match options.use_expired_data {
+                Some(u) => u,
+                None => self.use_expired_data,
+            },
+        )
+        .await;
 
         let mut entries = self
-            .filter_unexpired_entry(&sync_source_keys, entries)
+            .filter_unexpired_entry(
+                &sync_source_keys,
+                entries,
+                match options.use_expired_data {
+                    Some(u) => u,
+                    None => self.use_expired_data,
+                },
+            )
             .await;
         if !entries.is_empty() {
             from = "cache";
@@ -388,10 +427,22 @@ where
                     self.loader.clone(),
                     self.sfg.clone(),
                     self.cache_store.clone(),
-                    self.cache_none,
-                    self.expire_time,
-                    self.none_value_expire_time,
-                    self.async_set_cache,
+                    match options.cache_none {
+                        Some(b) => b,
+                        None => self.cache_none,
+                    },
+                    match options.expire_time {
+                        Some(e) => e,
+                        None => self.expire_time,
+                    },
+                    match options.none_value_expire_time {
+                        Some(e) => e,
+                        None => self.none_value_expire_time,
+                    },
+                    match options.async_set_cache {
+                        Some(a) => a,
+                        None => self.async_set_cache,
+                    },
                 )
                 .await
                 .inspect_err(|_| {
@@ -418,10 +469,22 @@ where
                                 self.loader.clone(),
                                 self.mfg.clone(),
                                 self.cache_store.clone(),
-                                self.cache_none,
-                                self.expire_time,
-                                self.none_value_expire_time,
-                                self.async_set_cache,
+                                match options.cache_none {
+                                    Some(b) => b,
+                                    None => self.cache_none,
+                                },
+                                match options.expire_time {
+                                    Some(e) => e,
+                                    None => self.expire_time,
+                                },
+                                match options.none_value_expire_time {
+                                    Some(e) => e,
+                                    None => self.none_value_expire_time,
+                                },
+                                match options.async_set_cache {
+                                    Some(a) => a,
+                                    None => self.async_set_cache,
+                                },
                             )
                             .await?,
                         );
@@ -455,7 +518,6 @@ where
             .filter_map(|entry| entry.value.map(|value| (entry.key, value)))
             .collect())
     }
-
     async fn mget_with_source_first(&self, keys: &[(K, E)]) -> Result<Vec<(K, V)>> {
         let mut entries = match *self.loader {
             Loader::SingleLoader(_) => {
@@ -503,7 +565,7 @@ where
                         return None;
                     }
                 }
-                return Some(k.0.clone());
+                Some(k.0.clone())
             })
             .collect::<Vec<_>>();
 
