@@ -1,8 +1,3 @@
-#![feature(impl_trait_in_assoc_type)]
-#![feature(async_closure)]
-#![feature(type_alias_impl_trait)]
-#![feature(associated_type_defaults)]
-
 mod autocache;
 mod builder;
 mod cache;
