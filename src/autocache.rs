@@ -146,7 +146,10 @@ where
                 error!(msg = "autocache: single source failed", error = ?err, key = ?key);
                 anyhow::bail!(AutoCacheError::SingleFlight);
             }
-            if value.is_none() {} // FIXME:
+            if value.is_none() {
+                error!(msg = "autocache: single source failed (not sf leader)", key = ?key);
+                anyhow::bail!(AutoCacheError::SingleFlight);
+            }
             let value = value.unwrap();
 
             if value.is_none() {
@@ -219,6 +222,9 @@ where
             .await;
 
         if err.is_some() {
+            anyhow::bail!(AutoCacheError::SingleFlight);
+        }
+        if kvs.is_none() {
             anyhow::bail!(AutoCacheError::SingleFlight);
         }
 
