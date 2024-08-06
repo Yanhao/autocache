@@ -265,16 +265,18 @@ where
             })
             .collect::<Vec<_>>();
 
-        if async_set_cache {
-            let key_entries = key_entries.clone();
-            tokio::spawn(async move {
-                let _ = cache
-                    .mset(&key_entries)
-                    .await
-                    .inspect_err(|e| error!("mset cache failed, error: {e}"));
-            });
-        } else {
-            cache.mset(&key_entries).await?;
+        if !key_entries.is_empty() {
+            if async_set_cache {
+                let key_entries = key_entries.clone();
+                tokio::spawn(async move {
+                    let _ = cache
+                        .mset(&key_entries)
+                        .await
+                        .inspect_err(|e| error!("mset cache failed, error: {e}"));
+                });
+            } else {
+                cache.mset(&key_entries).await?;
+            }
         }
 
         Ok(key_entries.into_iter().map(|(_, e)| e).collect::<Vec<_>>())
@@ -363,6 +365,9 @@ where
     }
 
     pub async fn mget(&self, keys: &[(K, E)]) -> Result<Vec<(K, V)>> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
         self.mget_with_option(keys, Options::default()).await
     }
 
@@ -575,9 +580,10 @@ where
             })
             .collect::<Vec<_>>();
 
-        let mut missed_entries = self.cache_store.mget(&missed_keys).await?;
-
-        entries.append(&mut missed_entries);
+        if !missed_keys.is_empty() {
+            let mut missed_entries = self.cache_store.mget(&missed_keys).await?;
+            entries.append(&mut missed_entries);
+        }
 
         Ok(entries
             .into_iter()
@@ -586,6 +592,10 @@ where
     }
 
     pub async fn mset(&self, kvs: &[(K, V)]) -> Result<()> {
+        if kvs.is_empty() {
+            return Ok(());
+        }
+
         let kvs = kvs
             .iter()
             .map(|kv| {
@@ -609,6 +619,9 @@ where
     }
 
     pub async fn mdel(&self, keys: &[K]) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
         self.cache_store.mdel(keys).await
     }
 
