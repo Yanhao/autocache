@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use arc_swap::{access::Access, ArcSwapOption};
+use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use redis::AsyncCommands;
 
@@ -10,6 +10,7 @@ use crate::{cache::Cache, SerilizableEntryTrait};
 pub struct RedisCache<K, V> {
     namespace: ArcSwapOption<String>,
 
+    ttl_sec: usize,
     redis_cli: redis::Client,
 
     _m1: std::marker::PhantomData<K>,
@@ -18,8 +19,12 @@ pub struct RedisCache<K, V> {
 
 impl<K, V> RedisCache<K, V> {
     pub fn new(cli: redis::Client) -> Self {
+        Self::new_with_ttl(cli, 0)
+    }
+    pub fn new_with_ttl(cli: redis::Client, ttl_sec: usize) -> Self {
         Self {
             namespace: None.into(),
+            ttl_sec,
 
             redis_cli: cli,
             _m1: std::marker::PhantomData,
@@ -90,26 +95,53 @@ where
 
         if kvs.len() == 1 {
             let kv = kvs.get(0).unwrap();
-            conn.set(
-                &self.generate_redis_key(kv.0.clone()),
-                kv.1.encode().unwrap().to_vec(),
-            )
-            .await?;
-
+            if self.ttl_sec == 0 {
+                conn.set(
+                    &self.generate_redis_key(kv.0.clone()),
+                    kv.1.encode().unwrap().to_vec(),
+                )
+                .await?;
+            } else {
+                conn.set_ex(
+                    &self.generate_redis_key(kv.0.clone()),
+                    kv.1.encode().unwrap().to_vec(),
+                    self.ttl_sec,
+                )
+                .await?;
+            }
             return Ok(());
         }
 
-        conn.mset(
-            &kvs.iter()
-                .map(|(key, value)| {
-                    (
-                        self.generate_redis_key(key.clone()),
-                        value.encode().unwrap().to_vec(),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )
-        .await?;
+        if self.ttl_sec == 0 {
+            conn.mset(
+                &kvs.iter()
+                    .map(|(key, value)| {
+                        (
+                            self.generate_redis_key(key.clone()),
+                            value.encode().unwrap().to_vec(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+        } else {
+            let mut pipe = redis::Pipeline::new();
+            pipe.mset(
+                &kvs.iter()
+                    .map(|(key, value)| {
+                        (
+                            self.generate_redis_key(key.clone()),
+                            value.encode().unwrap().to_vec(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            for (key, _) in kvs {
+                pipe.expire(&self.generate_redis_key(key.clone()), self.ttl_sec);
+            }
+
+            pipe.query_async(&mut conn).await?;
+        }
 
         Ok(())
     }

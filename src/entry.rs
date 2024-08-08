@@ -17,15 +17,15 @@ pub struct Entry<K, V> {
 }
 
 pub trait EntryTrait<K> {
-    fn is_outdated(&self) -> bool;
     fn get_key(&self) -> K;
+    fn is_expired(&self) -> bool;
 }
 
 impl<K, V> EntryTrait<K> for Entry<K, V>
 where
     K: Clone,
 {
-    fn is_outdated(&self) -> bool {
+    fn is_expired(&self) -> bool {
         if self.expire_at_ms.is_none() {
             return false;
         }
