@@ -293,7 +293,7 @@ where
             .filter_map(|key| {
                 for ent in entries.iter() {
                     if &ent.key == &key.0 {
-                        if !ent.is_outdated() {
+                        if !ent.is_expired() {
                             return None;
                         }
 
@@ -320,7 +320,7 @@ where
         if use_expired_data && !self.manually_refresh {
             let expired_keys = entries
                 .iter()
-                .filter_map(|e| e.is_outdated().then(|| e.key.clone()))
+                .filter_map(|e| e.is_expired().then(|| e.key.clone()))
                 .collect::<Vec<_>>();
 
             let _ = self
@@ -349,7 +349,7 @@ where
         entries
             .into_iter()
             .filter_map(|ent| {
-                if ent.is_outdated() && !use_expired_data {
+                if ent.is_expired() && !use_expired_data {
                     return None;
                 }
 
