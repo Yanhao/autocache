@@ -133,7 +133,7 @@ where
         let mut expires = Vec::with_capacity(128);
 
         for (key, ci) in cache_snap.iter() {
-            if ci.value.is_outdated() {
+            if ci.value.is_expired() {
                 expires.push((key.clone(), ci.value.clone()));
 
                 if expires.len() == 100 {
