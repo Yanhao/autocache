@@ -26,8 +26,8 @@ impl<K, V, L1, L2> TwoLevelCache<K, V, L1, L2> {
 
 impl<K, V, L1, L2> Cache for TwoLevelCache<K, V, L1, L2>
 where
-    K: Clone + Ord + Sync,
-    V: Clone + Sync + EntryTrait<K>,
+    K: Clone + Ord + Send + Sync,
+    V: Clone + Send + Sync + EntryTrait<K>,
     L1: Cache<Key = K, Value = V> + Sync,
     L2: Cache<Key = K, Value = V> + Sync,
 {

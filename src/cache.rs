@@ -4,15 +4,17 @@ pub trait Cache {
     type Key;
     type Value;
 
-    // return partial results when some keys are not found
-    async fn mget(&self, keys: &[Self::Key]) -> Result<Vec<Self::Value>>;
+    /// Returns partial results when some keys are not found.
+    fn mget(
+        &self,
+        keys: &[Self::Key],
+    ) -> impl std::future::Future<Output = Result<Vec<Self::Value>>> + Send;
 
     fn mset(
         &self,
         kvs: &[(Self::Key, Self::Value)],
-    ) -> impl std::future::Future<Output = Result<()>> + std::marker::Send;
-    // async fn mset(&self, kvs: &[(Self::Key, Self::Value)]) -> Result<()>;
-    async fn mdel(&self, keys: &[Self::Key]) -> Result<()>;
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+    fn mdel(&self, keys: &[Self::Key]) -> impl std::future::Future<Output = Result<()>> + Send;
 
     fn name(&self) -> &'static str;
     fn set_ns(&self, _ns: String) {}

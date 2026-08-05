@@ -13,6 +13,20 @@ use crate::{
 
 fn on_metrics(_method: &str, _is_error: bool, _ns: &str, _from: &str, _cache_name: &str) {}
 
+static SOURCE_FIRST_METRIC_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SOURCE_FIRST_METRIC_ERRORS: AtomicUsize = AtomicUsize::new(0);
+static SOURCE_FIRST_METRIC_SOURCE: AtomicUsize = AtomicUsize::new(0);
+
+fn source_first_metrics(_method: &str, is_error: bool, _ns: &str, from: &str, _cache_name: &str) {
+    SOURCE_FIRST_METRIC_CALLS.fetch_add(1, Ordering::SeqCst);
+    if is_error {
+        SOURCE_FIRST_METRIC_ERRORS.fetch_add(1, Ordering::SeqCst);
+    }
+    if from == "source" {
+        SOURCE_FIRST_METRIC_SOURCE.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Item {
     count: u32,
@@ -205,6 +219,70 @@ async fn test_source_first_honors_request_scoped_negative_caching() {
 
     assert!(first.is_empty());
     assert!(second.is_empty());
+    assert_eq!(source_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_source_first_records_success_and_error_metrics() {
+    SOURCE_FIRST_METRIC_CALLS.store(0, Ordering::SeqCst);
+    SOURCE_FIRST_METRIC_ERRORS.store(0, Ordering::SeqCst);
+    SOURCE_FIRST_METRIC_SOURCE.store(0, Ordering::SeqCst);
+
+    let success = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .source_first(true)
+        .on_metrics(source_first_metrics)
+        .single_loader(|key: String, ()| async move { Ok(Some(key)) }.boxed())
+        .build()
+        .unwrap();
+    success
+        .mget(&[("success-key".to_string(), ())])
+        .await
+        .unwrap();
+
+    let failure = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .source_first(true)
+        .on_metrics(source_first_metrics)
+        .single_loader(|_key: String, ()| {
+            async move { Err::<Option<String>, _>(anyhow::anyhow!("loader failed")) }.boxed()
+        })
+        .build()
+        .unwrap();
+    failure
+        .mget(&[("failure-key".to_string(), ())])
+        .await
+        .unwrap_err();
+
+    assert_eq!(SOURCE_FIRST_METRIC_CALLS.load(Ordering::SeqCst), 2);
+    assert_eq!(SOURCE_FIRST_METRIC_ERRORS.load(Ordering::SeqCst), 1);
+    assert_eq!(SOURCE_FIRST_METRIC_SOURCE.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn test_async_cache_fill_falls_back_without_tokio_runtime() {
+    let source_calls = Arc::new(AtomicUsize::new(0));
+    let loader_calls = source_calls.clone();
+    let ac = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .async_set_cache(true)
+        .single_loader(move |key: String, ()| {
+            let loader_calls = loader_calls.clone();
+            async move {
+                loader_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(format!("source:{key}")))
+            }
+            .boxed()
+        })
+        .build()
+        .unwrap();
+
+    let key = "test-key".to_string();
+    let first = futures::executor::block_on(ac.mget(&[(key.clone(), ())])).unwrap();
+    let second = futures::executor::block_on(ac.mget(&[(key.clone(), ())])).unwrap();
+
+    assert_eq!(first, vec![(key.clone(), "source:test-key".to_string())]);
+    assert_eq!(second, vec![(key, "source:test-key".to_string())]);
     assert_eq!(source_calls.load(Ordering::SeqCst), 1);
 }
 

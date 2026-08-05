@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use arc_swap::ArcSwapOption;
 use chrono::prelude::*;
 use futures::future::BoxFuture;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{
     builder::AutoCacheBuilder,
@@ -137,6 +137,37 @@ where
         }
     }
 
+    async fn set_cache_entries(
+        cache: Arc<C>,
+        entries: Vec<(K, Entry<K, V>)>,
+        async_set_cache: bool,
+    ) {
+        if async_set_cache {
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    runtime.spawn(async move {
+                        let _ = cache
+                            .mset(&entries)
+                            .await
+                            .inspect_err(|e| error!("mset cache failed, error: {e}"));
+                    });
+                    return;
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "autocache: Tokio runtime unavailable; setting cache synchronously"
+                    );
+                }
+            }
+        }
+
+        let _ = cache
+            .mset(&entries)
+            .await
+            .inspect_err(|e| error!("mset cache failed, error: {e}"));
+    }
+
     async fn source_by_sloader(
         keys: &[(K, E)],
         loader: Arc<Loader<K, V, E>>,
@@ -184,23 +215,17 @@ where
                         ),
                     };
 
-                    if async_set_cache {
-                        let key = loader_key.clone();
-                        let cache_entry = entry.clone();
-                        tokio::spawn(async move {
-                            debug!(msg = "autocache: async set cache", key = ?key);
-                            let _ = loader_cache
-                                .mset(&[(key.clone(), cache_entry)])
-                                .await
-                                .inspect_err(|e| error!("mset cache failed, error: {e}"));
-                        });
-                    } else {
-                        debug!(msg = "autocache: sync set cache", key = ?loader_key);
-                        let _ = loader_cache
-                            .mset(&[(loader_key.clone(), entry.clone())])
-                            .await
-                            .inspect_err(|e| error!("mset cache failed, error: {e}"));
-                    }
+                    debug!(
+                        msg = "autocache: set cache",
+                        key = ?loader_key,
+                        asynchronous = async_set_cache
+                    );
+                    Self::set_cache_entries(
+                        loader_cache,
+                        vec![(loader_key.clone(), entry.clone())],
+                        async_set_cache,
+                    )
+                    .await;
 
                     Ok(Some(entry))
                 })
@@ -271,20 +296,7 @@ where
                 .collect::<Vec<_>>();
 
             if !key_entries.is_empty() {
-                if async_set_cache {
-                    let cache_entries = key_entries.clone();
-                    tokio::spawn(async move {
-                        let _ = cache
-                            .mset(&cache_entries)
-                            .await
-                            .inspect_err(|e| error!("mset cache failed, error: {e}"));
-                    });
-                } else {
-                    let _ = cache
-                        .mset(&key_entries)
-                        .await
-                        .inspect_err(|e| error!("mset cache failed, error: {e}"));
-                }
+                Self::set_cache_entries(cache, key_entries.clone(), async_set_cache).await;
             }
 
             Ok(key_entries.into_iter().map(|(_, entry)| entry).collect())
@@ -383,11 +395,20 @@ where
     }
 
     pub async fn mget_with_option(&self, keys: &[(K, E)], options: Options) -> Result<Vec<(K, V)>> {
-        if options.source_first == Some(true) {
-            return self.mget_with_source_first(keys, &options).await;
-        }
-        if self.source_first && options.source_first != Some(false) {
-            return self.mget_with_source_first(keys, &options).await;
+        let source_first = options.source_first == Some(true)
+            || (self.source_first && options.source_first != Some(false));
+        if source_first {
+            let result = self.mget_with_source_first(keys, &options).await;
+            if let Some(metrics) = self.on_metrics {
+                metrics(
+                    "mget",
+                    result.is_err(),
+                    self.namespace.as_deref().unwrap_or(""),
+                    "source",
+                    self.cache_store.name(),
+                );
+            }
+            return result;
         }
 
         let requested_use_expired_data = options.use_expired_data.unwrap_or(self.use_expired_data);
