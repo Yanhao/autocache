@@ -21,6 +21,11 @@ pub(crate) type MetricsCallback =
 type SingleFlight<K, V> = Arc<Group<K, Option<Entry<K, V>>>>;
 type MultiFlight<K, V> = Arc<Group<BatchKey<K>, Vec<Entry<K, V>>>>;
 
+enum RefreshEnqueueMode {
+    WaitForCapacity,
+    BestEffort,
+}
+
 #[derive(Clone)]
 struct MetricsContext {
     callback: MetricsCallback,
@@ -92,6 +97,7 @@ where
     pub(crate) max_batch_size: usize,
     pub(crate) async_set_cache: bool,
     pub(crate) async_cache_write_permits: Arc<tokio::sync::Semaphore>,
+    pub(crate) async_refresh_queue_capacity: usize,
     pub(crate) use_expired_data: bool, // means async source
     pub(crate) manually_refresh: bool,
 
@@ -121,7 +127,8 @@ where
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         self.stop_ch.replace(tx);
 
-        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(512);
+        let (input_tx, mut input_rx) =
+            tokio::sync::mpsc::channel(self.async_refresh_queue_capacity);
         self.async_refresh_channel.store(Some(Arc::new(input_tx)));
 
         let loader = self.loader.clone();
@@ -474,7 +481,7 @@ where
                 .map(|e| e.key.clone())
                 .collect::<Vec<_>>();
 
-            self.refresh(
+            self.enqueue_refresh(
                 &keys
                     .iter()
                     .filter_map(|k| {
@@ -485,6 +492,7 @@ where
                         }
                     })
                     .collect::<Vec<_>>(),
+                RefreshEnqueueMode::BestEffort,
             )
             .await?;
         }
@@ -724,7 +732,7 @@ where
         self.cache_store.mdel(keys).await
     }
 
-    pub async fn refresh(&self, keys: &[(K, E)]) -> Result<()> {
+    async fn enqueue_refresh(&self, keys: &[(K, E)], mode: RefreshEnqueueMode) -> Result<()> {
         let Some(sender) = self.async_refresh_channel.load_full() else {
             bail!(AutoCacheError::Unsupported);
         };
@@ -739,10 +747,44 @@ where
                 continue;
             }
 
-            let permit = sender.reserve().await.map_err(|e| {
-                error!("autocache: reserve async source task failed!, error: {e}");
-                anyhow::anyhow!("reserve async source task failed: {e}")
-            })?;
+            let permit = match mode {
+                RefreshEnqueueMode::WaitForCapacity => sender.reserve().await.map_err(|error| {
+                    error!(%error, "autocache: reserve async source task failed");
+                    anyhow::anyhow!("reserve async source task failed: {error}")
+                })?,
+                RefreshEnqueueMode::BestEffort => match sender.try_reserve() {
+                    Ok(permit) => permit,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        debug!(
+                            key_count = keys.len(),
+                            "autocache: async refresh queue is full; skipping automatic refresh"
+                        );
+                        if let Some(metrics) = self.on_metrics {
+                            metrics(
+                                "refresh",
+                                true,
+                                self.namespace.as_deref().unwrap_or(""),
+                                "source",
+                                self.cache_store.name(),
+                            );
+                        }
+                        return Ok(());
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        warn!("autocache: async refresh worker is unavailable; skipping automatic refresh");
+                        if let Some(metrics) = self.on_metrics {
+                            metrics(
+                                "refresh",
+                                true,
+                                self.namespace.as_deref().unwrap_or(""),
+                                "source",
+                                self.cache_store.name(),
+                            );
+                        }
+                        return Ok(());
+                    }
+                },
+            };
             let task_keys = {
                 let mut pending_refresh_keys = self.pending_refresh_keys.lock();
                 keys.iter()
@@ -766,6 +808,11 @@ where
         }
 
         Ok(())
+    }
+
+    pub async fn refresh(&self, keys: &[(K, E)]) -> Result<()> {
+        self.enqueue_refresh(keys, RefreshEnqueueMode::WaitForCapacity)
+            .await
     }
 
     pub async fn with_cache<T>(

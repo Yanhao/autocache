@@ -19,6 +19,7 @@ static SOURCE_FIRST_METRIC_SOURCE: AtomicUsize = AtomicUsize::new(0);
 static CACHE_FIRST_METRIC_ERRORS: AtomicUsize = AtomicUsize::new(0);
 static CACHE_FIRST_METRIC_SOURCE: AtomicUsize = AtomicUsize::new(0);
 static ASYNC_CACHE_WRITE_METRIC_ERRORS: AtomicUsize = AtomicUsize::new(0);
+static ASYNC_REFRESH_METRIC_ERRORS: AtomicUsize = AtomicUsize::new(0);
 
 fn source_first_metrics(_method: &str, is_error: bool, _ns: &str, from: &str, _cache_name: &str) {
     SOURCE_FIRST_METRIC_CALLS.fetch_add(1, Ordering::SeqCst);
@@ -48,6 +49,12 @@ fn async_cache_write_metrics(
 ) {
     if method == "mset" && is_error {
         ASYNC_CACHE_WRITE_METRIC_ERRORS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn async_refresh_metrics(method: &str, is_error: bool, _ns: &str, _from: &str, _cache_name: &str) {
+    if method == "refresh" && is_error {
+        ASYNC_REFRESH_METRIC_ERRORS.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -653,6 +660,65 @@ async fn test_concurrent_stale_reads_enqueue_only_one_refresh_per_key() {
     assert_eq!(source_calls.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test]
+async fn test_stale_read_does_not_wait_for_refresh_queue_capacity() {
+    const REFRESH_QUEUE_CAPACITY: usize = 2;
+
+    ASYNC_REFRESH_METRIC_ERRORS.store(0, Ordering::SeqCst);
+    let refresh_started = Arc::new(tokio::sync::Notify::new());
+    let loader_refresh_started = refresh_started.clone();
+    let release_refresh = Arc::new(tokio::sync::Notify::new());
+    let loader_release_refresh = release_refresh.clone();
+    let ac = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .expire_time(std::time::Duration::ZERO)
+        .use_expired_data(true)
+        .async_refresh_queue_capacity(REFRESH_QUEUE_CAPACITY)
+        .on_metrics(async_refresh_metrics)
+        .single_loader(move |key: String, ()| {
+            let loader_refresh_started = loader_refresh_started.clone();
+            let loader_release_refresh = loader_release_refresh.clone();
+            async move {
+                if key == "blocking-key" {
+                    loader_refresh_started.notify_one();
+                    loader_release_refresh.notified().await;
+                }
+                Ok(Some(format!("source:{key}")))
+            }
+            .boxed()
+        })
+        .build()
+        .unwrap();
+
+    let stale_key = "stale-key".to_string();
+    ac.mset(&[(stale_key.clone(), "stale-value".to_string())])
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+    ac.refresh(&[("blocking-key".to_string(), ())])
+        .await
+        .unwrap();
+    refresh_started.notified().await;
+    for index in 0..REFRESH_QUEUE_CAPACITY {
+        ac.refresh(&[(format!("queued-key-{index}"), ())])
+            .await
+            .unwrap();
+    }
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        ac.mget(&[(stale_key.clone(), ())]),
+    )
+    .await
+    .expect("stale read should not wait for refresh queue capacity")
+    .unwrap();
+
+    assert_eq!(result, vec![(stale_key, "stale-value".to_string())]);
+    assert_eq!(ASYNC_REFRESH_METRIC_ERRORS.load(Ordering::SeqCst), 1);
+    release_refresh.notify_one();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_singleflight_uses_the_complete_typed_key_identity() {
     let source_calls = Arc::new(AtomicUsize::new(0));
@@ -836,6 +902,16 @@ fn test_builder_returns_errors_instead_of_panicking_for_invalid_configuration() 
     assert_eq!(
         invalid_async_write_limit.err().unwrap().to_string(),
         "max_concurrent_async_cache_writes must be greater than zero"
+    );
+
+    let invalid_refresh_queue_capacity = StringAutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .single_loader(|key: String, ()| async move { Ok(Some(key)) }.boxed())
+        .async_refresh_queue_capacity(0)
+        .build();
+    assert_eq!(
+        invalid_refresh_queue_capacity.err().unwrap().to_string(),
+        "async_refresh_queue_capacity must be greater than zero"
     );
 
     let missing_runtime = StringAutoCache::builder()

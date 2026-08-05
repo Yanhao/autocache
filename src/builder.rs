@@ -15,6 +15,7 @@ use crate::{
 };
 
 const DEFAULT_MAX_CONCURRENT_ASYNC_CACHE_WRITES: usize = 64;
+const DEFAULT_ASYNC_REFRESH_QUEUE_CAPACITY: usize = 512;
 
 pub struct AutoCacheBuilder<K, V, C, E>
 where
@@ -32,6 +33,7 @@ where
     pub(crate) max_batch_size: usize,
     pub(crate) async_set_cache: bool,
     pub(crate) max_concurrent_async_cache_writes: usize,
+    pub(crate) async_refresh_queue_capacity: usize,
     pub(crate) manually_refresh: bool,
 
     pub(crate) use_expired_data: bool,
@@ -68,6 +70,7 @@ where
             max_batch_size: 100,
             async_set_cache: false,
             max_concurrent_async_cache_writes: DEFAULT_MAX_CONCURRENT_ASYNC_CACHE_WRITES,
+            async_refresh_queue_capacity: DEFAULT_ASYNC_REFRESH_QUEUE_CAPACITY,
             cache_none: false,
 
             source_first: false,
@@ -142,6 +145,16 @@ where
         self
     }
 
+    /// Sets the maximum number of pending asynchronous refresh batches.
+    ///
+    /// The default is 512. Automatic stale-data refreshes are skipped when the
+    /// queue is full, while explicit [`AutoCache::refresh`] calls wait for
+    /// capacity. The value must be greater than zero.
+    pub fn async_refresh_queue_capacity(mut self, capacity: usize) -> Self {
+        self.async_refresh_queue_capacity = capacity;
+        self
+    }
+
     /// Enables best-effort asynchronous cache fills.
     ///
     /// Async fills are unordered and limited by
@@ -185,7 +198,9 @@ where
     /// Registers a callback for cache operation metrics.
     ///
     /// Source reads use method `mget`. Failed or skipped automatic cache fills
-    /// use method `mset` with `is_error=true` and `from="source"`.
+    /// use method `mset` with `is_error=true` and `from="source"`. Automatic
+    /// refreshes skipped due to queue saturation or worker unavailability use
+    /// method `refresh` with `is_error=true` and `from="source"`.
     pub fn on_metrics(
         mut self,
         func: fn(method: &str, is_error: bool, ns: &str, from: &str, cache_name: &str),
@@ -203,6 +218,9 @@ where
         if self.max_concurrent_async_cache_writes == 0 {
             return Err(AutoCacheError::InvalidMaxConcurrentAsyncCacheWrites.into());
         }
+        if self.async_refresh_queue_capacity == 0 {
+            return Err(AutoCacheError::InvalidAsyncRefreshQueueCapacity.into());
+        }
 
         let mut ac = AutoCache::<K, V, C, E> {
             cache_store: Arc::new(cache),
@@ -217,6 +235,7 @@ where
             async_cache_write_permits: Arc::new(tokio::sync::Semaphore::new(
                 self.max_concurrent_async_cache_writes,
             )),
+            async_refresh_queue_capacity: self.async_refresh_queue_capacity,
             use_expired_data: self.use_expired_data,
             manually_refresh: self.manually_refresh,
 
