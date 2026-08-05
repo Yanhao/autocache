@@ -167,6 +167,10 @@ where
         self
     }
 
+    /// Registers a callback for cache operation metrics.
+    ///
+    /// Source reads use method `mget`. Failed or skipped automatic cache fills
+    /// use method `mset` with `is_error=true` and `from="source"`.
     pub fn on_metrics(
         mut self,
         func: fn(method: &str, is_error: bool, ns: &str, from: &str, cache_name: &str),

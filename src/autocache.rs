@@ -16,6 +16,27 @@ use crate::{
     Options,
 };
 
+type MetricsCallback = fn(method: &str, is_error: bool, ns: &str, from: &str, cache_name: &str);
+
+#[derive(Clone)]
+struct MetricsContext {
+    callback: MetricsCallback,
+    namespace: String,
+}
+
+impl MetricsContext {
+    fn record(&self, method: &str, is_error: bool, from: &str, cache_name: &str) {
+        (self.callback)(method, is_error, &self.namespace, from, cache_name);
+    }
+}
+
+#[derive(Clone)]
+struct CacheFillConfig {
+    asynchronous: bool,
+    permits: Arc<tokio::sync::Semaphore>,
+    metrics: Option<MetricsContext>,
+}
+
 pub struct AutoCache<K, V, C, E>
 where
     K: Clone + Eq + Hash,
@@ -44,8 +65,7 @@ where
     pub(crate) pending_refresh_keys: Arc<parking_lot::Mutex<HashSet<K>>>,
     pub(crate) stop_ch: Option<tokio::sync::mpsc::Sender<()>>,
 
-    pub(crate) on_metrics:
-        Option<fn(method: &str, is_error: bool, ns: &str, from: &str, cache_name: &str)>,
+    pub(crate) on_metrics: Option<MetricsCallback>,
 }
 
 impl<K, V, C, E> AutoCache<K, V, C, E>
@@ -77,7 +97,7 @@ where
         let sfg = self.sfg.clone();
         let mfg = self.mfg.clone();
         let pending_refresh_keys = self.pending_refresh_keys.clone();
-        let async_cache_write_permits = self.async_cache_write_permits.clone();
+        let cache_fill_config = self.cache_fill_config(false);
 
         runtime.spawn(async move {
             loop {
@@ -101,8 +121,7 @@ where
                                     cache_none,
                                     expire_time,
                                     none_value_expire_time,
-                                    false,
-                                    async_cache_write_permits.clone(),
+                                    cache_fill_config.clone(),
                                 )
                                 .await.inspect_err(|e| error!("async source by sloader failed, error {e}"))
                             }
@@ -115,8 +134,7 @@ where
                                     cache_none,
                                     expire_time,
                                     none_value_expire_time,
-                                    false,
-                                    async_cache_write_permits.clone(),
+                                    cache_fill_config.clone(),
                                 )
                                 .await.inspect_err(|e| error!("async source by mloader failed, error {e}"))
                             }
@@ -141,23 +159,52 @@ where
         }
     }
 
+    fn expiration_timestamp(duration: std::time::Duration) -> Result<i64> {
+        let duration = chrono::Duration::from_std(duration)
+            .map_err(|_| AutoCacheError::InvalidExpirationDuration)?;
+        Utc::now()
+            .checked_add_signed(duration)
+            .map(|expires_at| expires_at.timestamp_millis())
+            .ok_or_else(|| AutoCacheError::InvalidExpirationDuration.into())
+    }
+
+    fn cache_fill_config(&self, asynchronous: bool) -> CacheFillConfig {
+        CacheFillConfig {
+            asynchronous,
+            permits: self.async_cache_write_permits.clone(),
+            metrics: self.on_metrics.map(|callback| MetricsContext {
+                callback,
+                namespace: self.namespace.clone().unwrap_or_default(),
+            }),
+        }
+    }
+
+    async fn write_cache_entries(
+        cache: Arc<C>,
+        entries: Vec<(K, Entry<K, V>)>,
+        metrics: Option<MetricsContext>,
+    ) {
+        if let Err(error) = cache.mset(&entries).await {
+            error!("mset cache failed, error: {error}");
+            if let Some(metrics) = metrics {
+                metrics.record("mset", true, "source", cache.name());
+            }
+        }
+    }
+
     async fn set_cache_entries(
         cache: Arc<C>,
         entries: Vec<(K, Entry<K, V>)>,
-        async_set_cache: bool,
-        async_cache_write_permits: Arc<tokio::sync::Semaphore>,
+        config: CacheFillConfig,
     ) {
-        if async_set_cache {
+        if config.asynchronous {
             match tokio::runtime::Handle::try_current() {
                 Ok(runtime) => {
-                    match async_cache_write_permits.try_acquire_owned() {
+                    match config.permits.clone().try_acquire_owned() {
                         Ok(permit) => {
                             runtime.spawn(async move {
                                 let _permit = permit;
-                                let _ = cache
-                                    .mset(&entries)
-                                    .await
-                                    .inspect_err(|e| error!("mset cache failed, error: {e}"));
+                                Self::write_cache_entries(cache, entries, config.metrics).await;
                             });
                         }
                         Err(error) => {
@@ -167,6 +214,9 @@ where
                                 error = %error,
                                 "autocache: async cache write limit reached; skipping cache fill"
                             );
+                            if let Some(metrics) = config.metrics {
+                                metrics.record("mset", true, "source", cache.name());
+                            }
                         }
                     }
                     return;
@@ -180,10 +230,7 @@ where
             }
         }
 
-        let _ = cache
-            .mset(&entries)
-            .await
-            .inspect_err(|e| error!("mset cache failed, error: {e}"));
+        Self::write_cache_entries(cache, entries, config.metrics).await;
     }
 
     async fn invalidate_cache_keys(cache: &C, keys: &[K]) {
@@ -204,8 +251,7 @@ where
         cache_none: bool,
         expire_time: std::time::Duration,
         none_value_expire_time: std::time::Duration,
-        async_set_cache: bool,
-        async_cache_write_permits: Arc<tokio::sync::Semaphore>,
+        cache_fill_config: CacheFillConfig,
     ) -> Result<Vec<Entry<K, V>>> {
         let Loader::<K, V, E>::SingleLoader(ref sloader) = *loader else {
             unreachable!();
@@ -217,7 +263,7 @@ where
             let loader_key = key.clone();
             let loader_extra = extra.clone();
             let loader_cache = cache.clone();
-            let loader_cache_write_permits = async_cache_write_permits.clone();
+            let loader_cache_fill_config = cache_fill_config.clone();
             let entry = sfg
                 .work(key.clone(), async move {
                     let value = (sloader)(loader_key.clone(), loader_extra).await?;
@@ -244,22 +290,18 @@ where
                     let entry = Entry {
                         key: loader_key.clone(),
                         value,
-                        expire_at_ms: Some(
-                            (Utc::now() + chrono::Duration::from_std(entry_expire_time).unwrap())
-                                .timestamp_millis(),
-                        ),
+                        expire_at_ms: Some(Self::expiration_timestamp(entry_expire_time)?),
                     };
 
                     debug!(
                         msg = "autocache: set cache",
                         key = ?loader_key,
-                        asynchronous = async_set_cache
+                        asynchronous = loader_cache_fill_config.asynchronous
                     );
                     Self::set_cache_entries(
                         loader_cache,
                         vec![(loader_key.clone(), entry.clone())],
-                        async_set_cache,
-                        loader_cache_write_permits,
+                        loader_cache_fill_config,
                     )
                     .await;
 
@@ -283,8 +325,7 @@ where
         cache_none: bool,
         expire_time: std::time::Duration,
         none_value_expire_time: std::time::Duration,
-        async_set_cache: bool,
-        async_cache_write_permits: Arc<tokio::sync::Semaphore>,
+        cache_fill_config: CacheFillConfig,
     ) -> Result<Vec<Entry<K, V>>> {
         let Loader::<K, V, E>::MultiLoader(ref mloader) = *loader else {
             unreachable!();
@@ -305,10 +346,7 @@ where
                         Entry {
                             key: loaded_key.clone(),
                             value: Some(value.clone()),
-                            expire_at_ms: Some(
-                                (Utc::now() + chrono::Duration::from_std(expire_time).unwrap())
-                                    .timestamp_millis(),
-                            ),
+                            expire_at_ms: Some(Self::expiration_timestamp(expire_time)?),
                         },
                     ));
                 } else if cache_none {
@@ -317,11 +355,7 @@ where
                         Entry {
                             key: key.0.clone(),
                             value: None,
-                            expire_at_ms: Some(
-                                (Utc::now()
-                                    + chrono::Duration::from_std(none_value_expire_time).unwrap())
-                                .timestamp_millis(),
-                            ),
+                            expire_at_ms: Some(Self::expiration_timestamp(none_value_expire_time)?),
                         },
                     ));
                 } else {
@@ -334,13 +368,7 @@ where
             }
 
             if !key_entries.is_empty() {
-                Self::set_cache_entries(
-                    cache,
-                    key_entries.clone(),
-                    async_set_cache,
-                    async_cache_write_permits,
-                )
-                .await;
+                Self::set_cache_entries(cache, key_entries.clone(), cache_fill_config).await;
             }
 
             Ok(key_entries.into_iter().map(|(_, entry)| entry).collect())
@@ -495,96 +523,71 @@ where
         });
 
         if !sync_source_keys.is_empty() {
-            let mut missed_entries = match *self.loader {
-                Loader::SingleLoader(_) => Self::source_by_sloader(
-                    &sync_source_keys,
-                    self.loader.clone(),
-                    self.sfg.clone(),
-                    self.cache_store.clone(),
-                    match options.cache_none {
-                        Some(b) => b,
-                        None => self.cache_none,
-                    },
-                    match options.expire_time {
-                        Some(e) => e,
-                        None => self.expire_time,
-                    },
-                    match options.none_value_expire_time {
-                        Some(e) => e,
-                        None => self.none_value_expire_time,
-                    },
-                    match options.async_set_cache {
-                        Some(a) => a,
-                        None => self.async_set_cache,
-                    },
-                    self.async_cache_write_permits.clone(),
-                )
-                .await
-                .inspect_err(|_| {
-                    if let Some(metrics) = self.on_metrics {
-                        metrics(
-                            "mget",
-                            true,
-                            self.namespace.as_ref().unwrap_or(&"".to_string()),
-                            "source",
-                            self.cache_store.name(),
-                        );
+            let cache_none = options.cache_none.unwrap_or(self.cache_none);
+            let expire_time = options.expire_time.unwrap_or(self.expire_time);
+            let none_value_expire_time = options
+                .none_value_expire_time
+                .unwrap_or(self.none_value_expire_time);
+            let cache_fill_config =
+                self.cache_fill_config(options.async_set_cache.unwrap_or(self.async_set_cache));
+            let missed_entries = async {
+                match *self.loader {
+                    Loader::SingleLoader(_) => {
+                        Self::source_by_sloader(
+                            &sync_source_keys,
+                            self.loader.clone(),
+                            self.sfg.clone(),
+                            self.cache_store.clone(),
+                            cache_none,
+                            expire_time,
+                            none_value_expire_time,
+                            cache_fill_config,
+                        )
+                        .await
                     }
-                })?,
-                Loader::MultiLoader(_) => {
-                    let missed_key_vector = sync_source_keys
-                        .chunks(self.max_batch_size)
-                        .collect::<Vec<_>>();
-
-                    let mut entries: Vec<Entry<K, V>> = Vec::with_capacity(keys.len());
-                    for keys in missed_key_vector.into_iter() {
-                        entries.append(
-                            &mut Self::source_by_mloader(
-                                keys.to_vec(),
-                                self.loader.clone(),
-                                self.mfg.clone(),
-                                self.cache_store.clone(),
-                                match options.cache_none {
-                                    Some(b) => b,
-                                    None => self.cache_none,
-                                },
-                                match options.expire_time {
-                                    Some(e) => e,
-                                    None => self.expire_time,
-                                },
-                                match options.none_value_expire_time {
-                                    Some(e) => e,
-                                    None => self.none_value_expire_time,
-                                },
-                                match options.async_set_cache {
-                                    Some(a) => a,
-                                    None => self.async_set_cache,
-                                },
-                                self.async_cache_write_permits.clone(),
-                            )
-                            .await?,
-                        );
+                    Loader::MultiLoader(_) => {
+                        let mut entries = Vec::with_capacity(keys.len());
+                        for keys in sync_source_keys.chunks(self.max_batch_size) {
+                            entries.append(
+                                &mut Self::source_by_mloader(
+                                    keys.to_vec(),
+                                    self.loader.clone(),
+                                    self.mfg.clone(),
+                                    self.cache_store.clone(),
+                                    cache_none,
+                                    expire_time,
+                                    none_value_expire_time,
+                                    cache_fill_config.clone(),
+                                )
+                                .await?,
+                            );
+                        }
+                        Ok(entries)
                     }
-
-                    entries
-                }
-            };
-            if !missed_entries.is_empty() {
-                if from == "cache" {
-                    from = "both";
-                } else {
-                    from = "source";
                 }
             }
+            .await
+            .inspect_err(|_| {
+                if let Some(metrics) = self.on_metrics {
+                    metrics(
+                        "mget",
+                        true,
+                        self.namespace.as_deref().unwrap_or(""),
+                        "source",
+                        self.cache_store.name(),
+                    );
+                }
+            })?;
 
-            entries.append(&mut missed_entries);
+            from = if from == "cache" { "both" } else { "source" };
+            entries.extend(missed_entries);
         }
 
         if let Some(metrics) = self.on_metrics {
             metrics(
                 "mget",
                 false,
-                self.namespace.as_ref().unwrap_or(&"".to_string()),
+                self.namespace.as_deref().unwrap_or(""),
                 from,
                 self.cache_store.name(),
             );
@@ -604,7 +607,8 @@ where
         let none_value_expire_time = options
             .none_value_expire_time
             .unwrap_or(self.none_value_expire_time);
-        let async_set_cache = options.async_set_cache.unwrap_or(self.async_set_cache);
+        let cache_fill_config =
+            self.cache_fill_config(options.async_set_cache.unwrap_or(self.async_set_cache));
 
         let entries = match *self.loader {
             Loader::SingleLoader(_) => {
@@ -616,8 +620,7 @@ where
                     cache_none,
                     expire_time,
                     none_value_expire_time,
-                    async_set_cache,
-                    self.async_cache_write_permits.clone(),
+                    cache_fill_config,
                 )
                 .await?
             }
@@ -635,8 +638,7 @@ where
                             cache_none,
                             expire_time,
                             none_value_expire_time,
-                            async_set_cache,
-                            self.async_cache_write_permits.clone(),
+                            cache_fill_config.clone(),
                         )
                         .await?,
                     );
@@ -660,19 +662,16 @@ where
         let kvs = kvs
             .iter()
             .map(|kv| {
-                (
+                Ok((
                     kv.0.clone(),
                     Entry {
                         key: kv.0.clone(),
                         value: Some(kv.1.clone()),
-                        expire_at_ms: Some(
-                            (Utc::now() + chrono::Duration::from_std(self.expire_time).unwrap())
-                                .timestamp_millis(),
-                        ),
+                        expire_at_ms: Some(Self::expiration_timestamp(self.expire_time)?),
                     },
-                )
+                ))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
 
         self.cache_store.mset(&kvs).await?;
 

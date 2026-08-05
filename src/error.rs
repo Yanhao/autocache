@@ -11,6 +11,8 @@ pub enum AutoCacheError {
     InvalidMaxBatchSize,
     #[error("max_concurrent_async_cache_writes must be greater than zero")]
     InvalidMaxConcurrentAsyncCacheWrites,
+    #[error("expiration duration is out of range")]
+    InvalidExpirationDuration,
     #[error("a Tokio runtime is required for background tasks")]
     RuntimeUnavailable,
     #[error("unsupported behaviour")]

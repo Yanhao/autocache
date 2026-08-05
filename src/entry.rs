@@ -2,7 +2,7 @@ use std::fmt::Debug;
 
 #[cfg(feature = "serilize")]
 use bytes::Buf;
-use chrono::prelude::*;
+use chrono::Utc;
 #[cfg(feature = "serilize")]
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -26,13 +26,8 @@ where
     K: Clone,
 {
     fn is_expired(&self) -> bool {
-        if self.expire_at_ms.is_none() {
-            return false;
-        }
-
-        Utc.timestamp_millis_opt(self.expire_at_ms.unwrap())
-            .unwrap()
-            < Utc::now()
+        self.expire_at_ms
+            .is_some_and(|expire_at_ms| expire_at_ms < Utc::now().timestamp_millis())
     }
 
     fn get_key(&self) -> K {

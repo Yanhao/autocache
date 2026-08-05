@@ -8,7 +8,7 @@ use futures::FutureExt;
 use crate::{
     autocache::AutoCache,
     local_cache::{LocalCache, LocalCacheOption},
-    Cache, Entry, Options,
+    Cache, Entry, EntryTrait, Options,
 };
 
 fn on_metrics(_method: &str, _is_error: bool, _ns: &str, _from: &str, _cache_name: &str) {}
@@ -16,6 +16,9 @@ fn on_metrics(_method: &str, _is_error: bool, _ns: &str, _from: &str, _cache_nam
 static SOURCE_FIRST_METRIC_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SOURCE_FIRST_METRIC_ERRORS: AtomicUsize = AtomicUsize::new(0);
 static SOURCE_FIRST_METRIC_SOURCE: AtomicUsize = AtomicUsize::new(0);
+static CACHE_FIRST_METRIC_ERRORS: AtomicUsize = AtomicUsize::new(0);
+static CACHE_FIRST_METRIC_SOURCE: AtomicUsize = AtomicUsize::new(0);
+static ASYNC_CACHE_WRITE_METRIC_ERRORS: AtomicUsize = AtomicUsize::new(0);
 
 fn source_first_metrics(_method: &str, is_error: bool, _ns: &str, from: &str, _cache_name: &str) {
     SOURCE_FIRST_METRIC_CALLS.fetch_add(1, Ordering::SeqCst);
@@ -24,6 +27,27 @@ fn source_first_metrics(_method: &str, is_error: bool, _ns: &str, from: &str, _c
     }
     if from == "source" {
         SOURCE_FIRST_METRIC_SOURCE.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn cache_first_metrics(method: &str, is_error: bool, _ns: &str, from: &str, _cache_name: &str) {
+    if method == "mget" && is_error {
+        CACHE_FIRST_METRIC_ERRORS.fetch_add(1, Ordering::SeqCst);
+    }
+    if method == "mget" && !is_error && from == "source" {
+        CACHE_FIRST_METRIC_SOURCE.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn async_cache_write_metrics(
+    method: &str,
+    is_error: bool,
+    _ns: &str,
+    _from: &str,
+    _cache_name: &str,
+) {
+    if method == "mset" && is_error {
+        ASYNC_CACHE_WRITE_METRIC_ERRORS.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -378,6 +402,43 @@ async fn test_source_first_records_success_and_error_metrics() {
     assert_eq!(SOURCE_FIRST_METRIC_SOURCE.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test]
+async fn test_cache_first_records_multi_loader_errors_and_not_found_source() {
+    CACHE_FIRST_METRIC_ERRORS.store(0, Ordering::SeqCst);
+    CACHE_FIRST_METRIC_SOURCE.store(0, Ordering::SeqCst);
+
+    let not_found = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .on_metrics(cache_first_metrics)
+        .multi_loader(|_keys: Vec<(String, ())>| {
+            async move { Ok(Vec::<(String, String)>::new()) }.boxed()
+        })
+        .build()
+        .unwrap();
+    assert!(not_found
+        .mget(&[("not-found-key".to_string(), ())])
+        .await
+        .unwrap()
+        .is_empty());
+
+    let failure = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .on_metrics(cache_first_metrics)
+        .multi_loader(|_keys: Vec<(String, ())>| {
+            async move { Err::<Vec<(String, String)>, _>(anyhow::anyhow!("multi loader failed")) }
+                .boxed()
+        })
+        .build()
+        .unwrap();
+    failure
+        .mget(&[("failure-key".to_string(), ())])
+        .await
+        .unwrap_err();
+
+    assert_eq!(CACHE_FIRST_METRIC_SOURCE.load(Ordering::SeqCst), 1);
+    assert_eq!(CACHE_FIRST_METRIC_ERRORS.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn test_async_cache_fill_falls_back_without_tokio_runtime() {
     let source_calls = Arc::new(AtomicUsize::new(0));
@@ -409,6 +470,7 @@ fn test_async_cache_fill_falls_back_without_tokio_runtime() {
 async fn test_async_cache_fill_is_skipped_when_concurrency_limit_is_reached() {
     const WRITE_LIMIT: usize = 2;
 
+    ASYNC_CACHE_WRITE_METRIC_ERRORS.store(0, Ordering::SeqCst);
     let cache = BlockingWriteCache::new();
     let observer = cache.clone();
     let ac = AutoCache::builder()
@@ -416,6 +478,7 @@ async fn test_async_cache_fill_is_skipped_when_concurrency_limit_is_reached() {
         .source_first(true)
         .async_set_cache(true)
         .max_concurrent_async_cache_writes(WRITE_LIMIT)
+        .on_metrics(async_cache_write_metrics)
         .single_loader(|key: String, ()| async move { Ok(Some(key)) }.boxed())
         .build()
         .unwrap();
@@ -446,6 +509,85 @@ async fn test_async_cache_fill_is_skipped_when_concurrency_limit_is_reached() {
     .await
     .unwrap();
     assert_eq!(observer.completed.load(Ordering::SeqCst), WRITE_LIMIT);
+    assert_eq!(ASYNC_CACHE_WRITE_METRIC_ERRORS.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_local_cache_zero_segments_uses_one_segment() {
+    let cache = LocalCache::new(LocalCacheOption {
+        segments: 0,
+        ..Default::default()
+    });
+    let key = "test-key".to_string();
+
+    cache
+        .mset(&[(key.clone(), "test-value".to_string())])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        cache.mget(&[key]).await.unwrap(),
+        vec!["test-value".to_string()]
+    );
+}
+
+#[test]
+fn test_entry_expiration_handles_extreme_timestamps() {
+    let future = Entry::<String, String> {
+        key: "future".to_string(),
+        value: None,
+        expire_at_ms: Some(i64::MAX),
+    };
+    let past = Entry::<String, String> {
+        key: "past".to_string(),
+        value: None,
+        expire_at_ms: Some(i64::MIN),
+    };
+
+    assert!(!future.is_expired());
+    assert!(past.is_expired());
+}
+
+#[tokio::test]
+async fn test_out_of_range_expiration_duration_returns_error() {
+    let positive = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .expire_time(std::time::Duration::MAX)
+        .single_loader(|key: String, ()| async move { Ok(Some(key)) }.boxed())
+        .build()
+        .unwrap();
+    assert_eq!(
+        positive
+            .mget(&[("test-key".to_string(), ())])
+            .await
+            .unwrap_err()
+            .to_string(),
+        "expiration duration is out of range"
+    );
+    assert_eq!(
+        positive
+            .mset(&[("test-key".to_string(), "test-value".to_string())])
+            .await
+            .unwrap_err()
+            .to_string(),
+        "expiration duration is out of range"
+    );
+
+    let negative = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .cache_none(true)
+        .none_value_expire_time(std::time::Duration::MAX)
+        .single_loader(|_key: String, ()| async move { Ok(None::<String>) }.boxed())
+        .build()
+        .unwrap();
+    assert_eq!(
+        negative
+            .mget(&[("test-key".to_string(), ())])
+            .await
+            .unwrap_err()
+            .to_string(),
+        "expiration duration is out of range"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
