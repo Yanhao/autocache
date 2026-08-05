@@ -52,11 +52,10 @@ where
     fn decode(data: bytes::Bytes) -> anyhow::Result<Self> {
         let eni: EntryInner<K> = serde_json::from_reader(data.reader())?;
 
-        let value = if eni.value_data.is_empty() {
-            None
-        } else {
-            Some(V::decode(eni.value_data.into())?)
-        };
+        let value = eni
+            .value_data
+            .map(|data| V::decode(data.into()))
+            .transpose()?;
 
         Ok(Self {
             key: eni.key,
@@ -66,10 +65,11 @@ where
     }
 
     fn encode(&self) -> anyhow::Result<bytes::Bytes> {
-        let value_data = match &self.value {
-            Some(v) => v.encode()?.to_vec(),
-            None => vec![],
-        };
+        let value_data = self
+            .value
+            .as_ref()
+            .map(|value| value.encode().map(|data| data.to_vec()))
+            .transpose()?;
 
         let eni = EntryInner {
             key: self.key.clone(),
@@ -85,6 +85,59 @@ where
 #[derive(Serialize, Deserialize)]
 struct EntryInner<K> {
     key: K,
-    value_data: Vec<u8>,
+    value_data: Option<Vec<u8>>,
     expire_at_ms: Option<i64>,
+}
+
+#[cfg(all(test, feature = "serilize"))]
+mod tests {
+    use bytes::Bytes;
+    use serde::{Deserialize, Serialize};
+
+    use super::{Entry, SerilizableEntryTrait};
+    use crate::Codec;
+
+    #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+    struct EmptyValue;
+
+    impl Codec for EmptyValue {
+        fn decode(data: Bytes) -> anyhow::Result<Self> {
+            anyhow::ensure!(data.is_empty(), "expected an empty payload");
+            Ok(Self)
+        }
+
+        fn encode(&self) -> anyhow::Result<Bytes> {
+            Ok(Bytes::new())
+        }
+    }
+
+    #[test]
+    fn some_empty_payload_round_trips_as_some() {
+        let entry = Entry {
+            key: "test-key".to_string(),
+            value: Some(EmptyValue),
+            expire_at_ms: Some(42),
+        };
+
+        let decoded = Entry::<String, EmptyValue>::decode(entry.encode().unwrap()).unwrap();
+
+        assert_eq!(decoded.key, entry.key);
+        assert_eq!(decoded.value, entry.value);
+        assert_eq!(decoded.expire_at_ms, entry.expire_at_ms);
+    }
+
+    #[test]
+    fn none_round_trips_as_none() {
+        let entry = Entry::<String, EmptyValue> {
+            key: "test-key".to_string(),
+            value: None,
+            expire_at_ms: Some(42),
+        };
+
+        let decoded = Entry::<String, EmptyValue>::decode(entry.encode().unwrap()).unwrap();
+
+        assert_eq!(decoded.key, entry.key);
+        assert_eq!(decoded.value, entry.value);
+        assert_eq!(decoded.expire_at_ms, entry.expire_at_ms);
+    }
 }
