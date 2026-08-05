@@ -112,7 +112,7 @@ impl AsRef<str> for TenantKey {
 
 #[tokio::test]
 async fn test_builder() {
-    tracing_subscriber::fmt::init();
+    let _ = tracing_subscriber::fmt::try_init();
 
     let ac = AutoCache::builder()
         .cache(LocalCache::new(LocalCacheOption {

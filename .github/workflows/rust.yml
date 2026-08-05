@@ -26,6 +26,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --all-features --all-targets
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --all-features --no-deps
       - name: Build all features
         run: cargo build --all-features --verbose
       - name: Run all tests
