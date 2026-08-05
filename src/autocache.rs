@@ -196,9 +196,10 @@ where
                         });
                     } else {
                         debug!(msg = "autocache: sync set cache", key = ?loader_key);
-                        loader_cache
+                        let _ = loader_cache
                             .mset(&[(loader_key.clone(), entry.clone())])
-                            .await?;
+                            .await
+                            .inspect_err(|e| error!("mset cache failed, error: {e}"));
                     }
 
                     Ok(Some(entry))
@@ -279,7 +280,10 @@ where
                             .inspect_err(|e| error!("mset cache failed, error: {e}"));
                     });
                 } else {
-                    cache.mset(&key_entries).await?;
+                    let _ = cache
+                        .mset(&key_entries)
+                        .await
+                        .inspect_err(|e| error!("mset cache failed, error: {e}"));
                 }
             }
 

@@ -1,8 +1,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use futures::FutureExt;
 use parking_lot::Mutex;
 
-use crate::{twolevel_cache::TwoLevelCache, Cache, Entry};
+use crate::{twolevel_cache::TwoLevelCache, AutoCache, Cache, Entry};
 
 type TestEntry = Entry<String, String>;
 
@@ -11,6 +12,7 @@ struct TestCache {
     data: Arc<Mutex<BTreeMap<String, TestEntry>>>,
     get_calls: Arc<Mutex<Vec<Vec<String>>>>,
     get_error: Arc<Mutex<Option<&'static str>>>,
+    set_error: Arc<Mutex<Option<&'static str>>>,
     del_error: Arc<Mutex<Option<&'static str>>>,
 }
 
@@ -32,6 +34,10 @@ impl Cache for TestCache {
     }
 
     async fn mset(&self, kvs: &[(Self::Key, Self::Value)]) -> anyhow::Result<()> {
+        if let Some(error) = *self.set_error.lock() {
+            anyhow::bail!(error);
+        }
+
         let mut data = self.data.lock();
         for (key, value) in kvs {
             data.insert(key.clone(), value.clone());
@@ -70,6 +76,14 @@ fn expired_entry(key: &str, value: &str) -> TestEntry {
         value: Some(value.to_string()),
         expire_at_ms: Some(0),
     }
+}
+
+fn unavailable_two_level_cache() -> TwoLevelCache<String, TestEntry, TestCache, TestCache> {
+    let l2 = TestCache::default();
+    *l2.get_error.lock() = Some("L2 read unavailable");
+    *l2.set_error.lock() = Some("L2 write unavailable");
+
+    TwoLevelCache::new(TestCache::default(), l2)
 }
 
 #[tokio::test]
@@ -198,6 +212,67 @@ async fn test_mdel_invalidates_l1_when_l2_fails() {
     assert_eq!(error.to_string(), "L2 unavailable");
     assert!(!l1_observer.data.lock().contains_key(&key));
     assert!(l2_observer.data.lock().contains_key(&key));
+}
+
+#[tokio::test]
+async fn test_single_loader_returns_source_value_when_cache_fill_fails() {
+    let ac = AutoCache::builder()
+        .cache(unavailable_two_level_cache())
+        .single_loader(|key: String, ()| async move { Ok(Some(format!("source:{key}"))) }.boxed())
+        .build()
+        .unwrap();
+
+    let key = "test-key".to_string();
+    let result = ac.mget(&[(key.clone(), ())]).await.unwrap();
+
+    assert_eq!(result, vec![(key, "source:test-key".to_string())]);
+}
+
+#[tokio::test]
+async fn test_multi_loader_returns_source_values_when_cache_fill_fails() {
+    let ac = AutoCache::builder()
+        .cache(unavailable_two_level_cache())
+        .multi_loader(|keys: Vec<(String, ())>| {
+            async move {
+                Ok(keys
+                    .into_iter()
+                    .map(|(key, ())| {
+                        let value = format!("source:{key}");
+                        (key, value)
+                    })
+                    .collect())
+            }
+            .boxed()
+        })
+        .build()
+        .unwrap();
+
+    let keys = vec![("key-1".to_string(), ()), ("key-2".to_string(), ())];
+    let result = ac.mget(&keys).await.unwrap();
+
+    assert_eq!(
+        result,
+        vec![
+            ("key-1".to_string(), "source:key-1".to_string()),
+            ("key-2".to_string(), "source:key-2".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_explicit_mset_still_propagates_cache_write_errors() {
+    let ac = AutoCache::builder()
+        .cache(unavailable_two_level_cache())
+        .single_loader(|key: String, ()| async move { Ok(Some(key)) }.boxed())
+        .build()
+        .unwrap();
+
+    let error = ac
+        .mset(&[("test-key".to_string(), "test-value".to_string())])
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), "L2 write unavailable");
 }
 
 #[cfg(all(feature = "localcache", feature = "rediscache"))]
