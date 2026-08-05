@@ -69,11 +69,12 @@ where
 
         if keys.len() == 1 {
             let key = keys.get(0).unwrap();
-            let data: bytes::Bytes = conn.get(&self.generate_redis_key(key.clone())).await?;
+            let data: Option<Bytes> = conn.get(&self.generate_redis_key(key.clone())).await?;
 
-            let value: V = V::decode(data)?;
-
-            return Ok(vec![value]);
+            return match data {
+                Some(data) => Ok(vec![V::decode(data)?]),
+                None => Ok(vec![]),
+            };
         }
 
         let res: Vec<Option<Bytes>> = conn
