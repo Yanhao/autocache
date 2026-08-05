@@ -120,6 +120,23 @@ async fn test_mget_loads_only_l1_misses_from_l2_and_warms_l1() {
 }
 
 #[tokio::test]
+async fn test_mget_returns_l2_entries_when_l1_warm_fails() {
+    let l1 = TestCache::default();
+    *l1.set_error.lock() = Some("L1 write unavailable");
+
+    let l2 = TestCache::default();
+    l2.mset(&[("test-key".to_string(), entry("test-key", "l2-value"))])
+        .await
+        .unwrap();
+    let cache = TwoLevelCache::new(l1, l2);
+
+    let entries = cache.mget(&["test-key".to_string()]).await.unwrap();
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].value.as_deref(), Some("l2-value"));
+}
+
+#[tokio::test]
 async fn test_mget_prefers_l2_when_l1_entry_is_expired() {
     let l1 = TestCache::default();
     l1.mset(&[(

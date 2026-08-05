@@ -71,7 +71,18 @@ where
             .map(|entry| (entry.get_key(), entry))
             .collect::<Vec<_>>();
         if !fresh_l2_entries.is_empty() {
-            self.local_cache.mset(&fresh_l2_entries).await?;
+            let _ = self
+                .local_cache
+                .mset(&fresh_l2_entries)
+                .await
+                .inspect_err(|error| {
+                    warn!(
+                        cache = self.local_cache.name(),
+                        entry_count = fresh_l2_entries.len(),
+                        error = %error,
+                        "autocache: failed to warm L1 cache with L2 entries"
+                    );
+                });
         }
 
         let l2_hit_keys = l2_entries
