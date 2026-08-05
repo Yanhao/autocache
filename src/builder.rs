@@ -6,7 +6,11 @@ use anyhow::Result;
 use futures::future::BoxFuture;
 
 use crate::{
-    autocache::AutoCache, cache::Cache, entry::Entry, error::AutoCacheError, loader::Loader,
+    autocache::{AutoCache, MetricsCallback},
+    cache::Cache,
+    entry::Entry,
+    error::AutoCacheError,
+    loader::Loader,
     singleflight::Group,
 };
 
@@ -33,8 +37,19 @@ where
     pub(crate) use_expired_data: bool,
     pub(crate) namespace: Option<String>,
 
-    pub(crate) on_metrics:
-        Option<fn(method: &str, is_error: bool, ns: &str, from: &str, cache_name: &str)>,
+    pub(crate) on_metrics: Option<MetricsCallback>,
+}
+
+impl<K, V, C, E> Default for AutoCacheBuilder<K, V, C, E>
+where
+    K: Clone + Debug + Eq + Hash + Sync + Send + 'static,
+    V: Clone + Debug + Sync + Send + 'static,
+    C: Cache<Key = K, Value = Entry<K, V>> + Sync + Send + 'static,
+    E: Clone + Debug + Sync + Send + 'static,
+{
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<K, V, C, E> AutoCacheBuilder<K, V, C, E>

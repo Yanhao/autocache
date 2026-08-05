@@ -7,6 +7,8 @@ use futures::future::BoxFuture;
 
 use crate::{cache::Cache, entry::EntryTrait, error::AutoCacheError};
 
+type ExpireListener<K, V> = Box<dyn Fn(Vec<(K, V)>) -> BoxFuture<'static, ()> + Send + Sync>;
+
 #[derive(Clone)]
 struct CacheItem<V> {
     time_to_remove_ms: Option<i64>,
@@ -24,8 +26,7 @@ pub struct TtlCache<K, V> {
     data: Arc<parking_lot::RwLock<im::OrdMap<K, CacheItem<V>>>>,
 
     ttl: Option<std::time::Duration>,
-    expire_listener:
-        ArcSwapOption<Box<dyn Fn(Vec<(K, V)>) -> BoxFuture<'static, ()> + Send + Sync>>,
+    expire_listener: ArcSwapOption<ExpireListener<K, V>>,
 
     stop_notifier: ArcSwapOption<tokio::sync::Notify>,
 }
@@ -113,7 +114,7 @@ where
             .transpose()?;
 
         let mut data = self.data.write();
-        for kv in kvs.into_iter() {
+        for kv in kvs {
             data.insert(
                 kv.0.clone(),
                 CacheItem {
@@ -147,7 +148,7 @@ where
 {
     async fn check_expires(
         cache: Arc<parking_lot::RwLock<im::OrdMap<K, CacheItem<V>>>>,
-        expire_listener: Arc<Box<dyn Fn(Vec<(K, V)>) -> BoxFuture<'static, ()> + Send + Sync>>,
+        expire_listener: Arc<ExpireListener<K, V>>,
     ) {
         let cache_snap = cache.read().clone();
 

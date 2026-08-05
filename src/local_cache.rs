@@ -66,7 +66,7 @@ where
             kvs.iter().map(|(k, _)| k).collect::<Vec<_>>()
         );
 
-        for kv in kvs.into_iter() {
+        for kv in kvs {
             self.data.insert(kv.0.clone(), kv.1.clone());
         }
 

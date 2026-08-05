@@ -39,19 +39,19 @@ where
 {
     fn generate_redis_key(&self, k: K) -> String {
         if let Some(ns) = self.namespace.load().as_ref() {
-            if ns.as_ref() == "" {
+            if ns.is_empty() {
                 return k.as_ref().to_string();
             }
 
             let mut key = String::new();
             key.push_str(ns);
-            key.push_str(":");
+            key.push(':');
 
             key.push_str(k.as_ref());
 
-            return key;
+            key
         } else {
-            return k.as_ref().to_string();
+            k.as_ref().to_string()
         }
     }
 }
@@ -72,7 +72,7 @@ where
         let mut conn = self.redis_cli.get_multiplexed_async_connection().await?;
 
         if let [key] = keys {
-            let data: Option<Bytes> = conn.get(&self.generate_redis_key(key.clone())).await?;
+            let data: Option<Bytes> = conn.get(self.generate_redis_key(key.clone())).await?;
 
             return match data {
                 Some(data) => Ok(vec![V::decode(data)?]),

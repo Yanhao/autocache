@@ -6,9 +6,9 @@ use once_cell::sync::Lazy;
 
 use crate::{autocache::AutoCache, ttl_cache::TtlCache, Cache, Entry};
 
-static AC: Lazy<
-    ArcSwapOption<AutoCache<String, String, TtlCache<String, Entry<String, String>>, ()>>,
-> = Lazy::new(|| None.into());
+type TestAutoCache = AutoCache<String, String, TtlCache<String, Entry<String, String>>, ()>;
+
+static AC: Lazy<ArcSwapOption<TestAutoCache>> = Lazy::new(|| None.into());
 
 #[tokio::test]
 async fn test_builder() {
@@ -45,8 +45,8 @@ async fn test_builder() {
 
     dbg!(&v1);
     assert_eq!(v1.len(), 1);
-    assert_eq!(v1.get(0).unwrap().0, String::from("test-key1"));
-    assert_eq!(v1.get(0).unwrap().1, String::from("test-key1"));
+    assert_eq!(v1.first().unwrap().0, String::from("test-key1"));
+    assert_eq!(v1.first().unwrap().1, String::from("test-key1"));
 }
 
 #[tokio::test]

@@ -143,6 +143,9 @@ async fn test_builder() {
 
     let v1 = ac.mget(&[("test-key1".to_string(), ())]).await.unwrap();
     dbg!(&v1);
+    assert_eq!(v1.len(), 1);
+    assert_eq!(v1[0].1.count, 1);
+    assert_eq!(v1[0].1.message, "test-key1");
     // assert_eq!(v1.len(), 1);
     // assert_eq!(
     //     v1.get(0),

@@ -16,7 +16,10 @@ use crate::{
     Options,
 };
 
-type MetricsCallback = fn(method: &str, is_error: bool, ns: &str, from: &str, cache_name: &str);
+pub(crate) type MetricsCallback =
+    fn(method: &str, is_error: bool, ns: &str, from: &str, cache_name: &str);
+type SingleFlight<K, V> = Arc<Group<K, Option<Entry<K, V>>>>;
+type MultiFlight<K, V> = Arc<Group<BatchKey<K>, Vec<Entry<K, V>>>>;
 
 #[derive(Clone)]
 struct MetricsContext {
@@ -37,6 +40,38 @@ struct CacheFillConfig {
     metrics: Option<MetricsContext>,
 }
 
+struct SourceLoadContext<K, V, C, E>
+where
+    K: Clone + Eq + Hash,
+    V: Clone,
+    C: Cache<Key = K, Value = Entry<K, V>>,
+{
+    loader: Arc<Loader<K, V, E>>,
+    cache: Arc<C>,
+    cache_none: bool,
+    expire_time: std::time::Duration,
+    none_value_expire_time: std::time::Duration,
+    cache_fill_config: CacheFillConfig,
+}
+
+impl<K, V, C, E> Clone for SourceLoadContext<K, V, C, E>
+where
+    K: Clone + Eq + Hash,
+    V: Clone,
+    C: Cache<Key = K, Value = Entry<K, V>>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            loader: self.loader.clone(),
+            cache: self.cache.clone(),
+            cache_none: self.cache_none,
+            expire_time: self.expire_time,
+            none_value_expire_time: self.none_value_expire_time,
+            cache_fill_config: self.cache_fill_config.clone(),
+        }
+    }
+}
+
 pub struct AutoCache<K, V, C, E>
 where
     K: Clone + Eq + Hash,
@@ -46,8 +81,8 @@ where
     pub(crate) cache_store: Arc<C>,
     pub(crate) loader: Arc<Loader<K, V, E>>,
 
-    pub(crate) sfg: Arc<Group<K, Option<Entry<K, V>>>>,
-    pub(crate) mfg: Arc<Group<BatchKey<K>, Vec<Entry<K, V>>>>,
+    pub(crate) sfg: SingleFlight<K, V>,
+    pub(crate) mfg: MultiFlight<K, V>,
 
     pub(crate) namespace: Option<String>,
     pub(crate) expire_time: std::time::Duration,
@@ -98,6 +133,14 @@ where
         let mfg = self.mfg.clone();
         let pending_refresh_keys = self.pending_refresh_keys.clone();
         let cache_fill_config = self.cache_fill_config(false);
+        let source_load_context = SourceLoadContext {
+            loader: loader.clone(),
+            cache: cache.clone(),
+            cache_none,
+            expire_time,
+            none_value_expire_time,
+            cache_fill_config,
+        };
 
         runtime.spawn(async move {
             loop {
@@ -115,26 +158,16 @@ where
                             Loader::SingleLoader(_) => {
                                 Self::source_by_sloader(
                                     &t.keys,
-                                    loader.clone(),
                                     sfg.clone(),
-                                    cache.clone(),
-                                    cache_none,
-                                    expire_time,
-                                    none_value_expire_time,
-                                    cache_fill_config.clone(),
+                                    source_load_context.clone(),
                                 )
                                 .await.inspect_err(|e| error!("async source by sloader failed, error {e}"))
                             }
                             Loader::MultiLoader(_) => {
                                 Self::source_by_mloader(
                                     t.keys,
-                                    loader.clone(),
                                     mfg.clone(),
-                                    cache.clone(),
-                                    cache_none,
-                                    expire_time,
-                                    none_value_expire_time,
-                                    cache_fill_config.clone(),
+                                    source_load_context.clone(),
                                 )
                                 .await.inspect_err(|e| error!("async source by mloader failed, error {e}"))
                             }
@@ -176,6 +209,23 @@ where
                 callback,
                 namespace: self.namespace.clone().unwrap_or_default(),
             }),
+        }
+    }
+
+    fn source_load_context(
+        &self,
+        cache_none: bool,
+        expire_time: std::time::Duration,
+        none_value_expire_time: std::time::Duration,
+        cache_fill_config: CacheFillConfig,
+    ) -> SourceLoadContext<K, V, C, E> {
+        SourceLoadContext {
+            loader: self.loader.clone(),
+            cache: self.cache_store.clone(),
+            cache_none,
+            expire_time,
+            none_value_expire_time,
+            cache_fill_config,
         }
     }
 
@@ -245,14 +295,17 @@ where
 
     async fn source_by_sloader(
         keys: &[(K, E)],
-        loader: Arc<Loader<K, V, E>>,
-        sfg: Arc<Group<K, Option<Entry<K, V>>>>,
-        cache: Arc<C>,
-        cache_none: bool,
-        expire_time: std::time::Duration,
-        none_value_expire_time: std::time::Duration,
-        cache_fill_config: CacheFillConfig,
+        sfg: SingleFlight<K, V>,
+        context: SourceLoadContext<K, V, C, E>,
     ) -> Result<Vec<Entry<K, V>>> {
+        let SourceLoadContext {
+            loader,
+            cache,
+            cache_none,
+            expire_time,
+            none_value_expire_time,
+            cache_fill_config,
+        } = context;
         let Loader::<K, V, E>::SingleLoader(ref sloader) = *loader else {
             unreachable!();
         };
@@ -319,14 +372,17 @@ where
 
     async fn source_by_mloader(
         keys: Vec<(K, E)>,
-        loader: Arc<Loader<K, V, E>>,
-        mfg: Arc<Group<BatchKey<K>, Vec<Entry<K, V>>>>,
-        cache: Arc<C>,
-        cache_none: bool,
-        expire_time: std::time::Duration,
-        none_value_expire_time: std::time::Duration,
-        cache_fill_config: CacheFillConfig,
+        mfg: MultiFlight<K, V>,
+        context: SourceLoadContext<K, V, C, E>,
     ) -> Result<Vec<Entry<K, V>>> {
+        let SourceLoadContext {
+            loader,
+            cache,
+            cache_none,
+            expire_time,
+            none_value_expire_time,
+            cache_fill_config,
+        } = context;
         let Loader::<K, V, E>::MultiLoader(ref mloader) = *loader else {
             unreachable!();
         };
@@ -386,7 +442,7 @@ where
             .iter()
             .filter_map(|key| {
                 for ent in entries.iter() {
-                    if &ent.key == &key.0 {
+                    if ent.key == key.0 {
                         if !ent.is_expired() {
                             return None;
                         }
@@ -414,7 +470,8 @@ where
         if use_expired_data && !self.manually_refresh {
             let expired_keys = entries
                 .iter()
-                .filter_map(|e| e.is_expired().then(|| e.key.clone()))
+                .filter(|e| e.is_expired())
+                .map(|e| e.key.clone())
                 .collect::<Vec<_>>();
 
             self.refresh(
@@ -449,7 +506,7 @@ where
                 }
 
                 for key in sync_source_keys.iter() {
-                    if &ent.key == &key.0 {
+                    if ent.key == key.0 {
                         return None;
                     }
                 }
@@ -494,12 +551,7 @@ where
         let mut from = "-";
         let entries = self
             .cache_store
-            .mget(
-                &keys
-                    .into_iter()
-                    .map(|key| key.0.clone())
-                    .collect::<Vec<_>>(),
-            )
+            .mget(&keys.iter().map(|key| key.0.clone()).collect::<Vec<_>>())
             .await?;
         debug!(msg = "autocache: mget from cache before filter", keys = ?keys, ret = ?{
             entries.iter().map(|e| e.key.clone()).collect::<Vec<_>>()
@@ -530,18 +582,19 @@ where
                 .unwrap_or(self.none_value_expire_time);
             let cache_fill_config =
                 self.cache_fill_config(options.async_set_cache.unwrap_or(self.async_set_cache));
+            let source_load_context = self.source_load_context(
+                cache_none,
+                expire_time,
+                none_value_expire_time,
+                cache_fill_config,
+            );
             let missed_entries = async {
                 match *self.loader {
                     Loader::SingleLoader(_) => {
                         Self::source_by_sloader(
                             &sync_source_keys,
-                            self.loader.clone(),
                             self.sfg.clone(),
-                            self.cache_store.clone(),
-                            cache_none,
-                            expire_time,
-                            none_value_expire_time,
-                            cache_fill_config,
+                            source_load_context,
                         )
                         .await
                     }
@@ -551,13 +604,8 @@ where
                             entries.append(
                                 &mut Self::source_by_mloader(
                                     keys.to_vec(),
-                                    self.loader.clone(),
                                     self.mfg.clone(),
-                                    self.cache_store.clone(),
-                                    cache_none,
-                                    expire_time,
-                                    none_value_expire_time,
-                                    cache_fill_config.clone(),
+                                    source_load_context.clone(),
                                 )
                                 .await?,
                             );
@@ -609,20 +657,16 @@ where
             .unwrap_or(self.none_value_expire_time);
         let cache_fill_config =
             self.cache_fill_config(options.async_set_cache.unwrap_or(self.async_set_cache));
+        let source_load_context = self.source_load_context(
+            cache_none,
+            expire_time,
+            none_value_expire_time,
+            cache_fill_config,
+        );
 
         let entries = match *self.loader {
             Loader::SingleLoader(_) => {
-                Self::source_by_sloader(
-                    keys,
-                    self.loader.clone(),
-                    self.sfg.clone(),
-                    self.cache_store.clone(),
-                    cache_none,
-                    expire_time,
-                    none_value_expire_time,
-                    cache_fill_config,
-                )
-                .await?
+                Self::source_by_sloader(keys, self.sfg.clone(), source_load_context).await?
             }
             Loader::MultiLoader(_) => {
                 let missed_key_vector = keys.chunks(self.max_batch_size).collect::<Vec<_>>();
@@ -632,13 +676,8 @@ where
                     entries.append(
                         &mut Self::source_by_mloader(
                             keys.to_vec(),
-                            self.loader.clone(),
                             self.mfg.clone(),
-                            self.cache_store.clone(),
-                            cache_none,
-                            expire_time,
-                            none_value_expire_time,
-                            cache_fill_config.clone(),
+                            source_load_context.clone(),
                         )
                         .await?,
                     );
