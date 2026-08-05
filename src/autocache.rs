@@ -140,6 +140,7 @@ where
         let mfg = self.mfg.clone();
         let pending_refresh_keys = self.pending_refresh_keys.clone();
         let cache_fill_config = self.cache_fill_config(false);
+        let refresh_metrics = cache_fill_config.metrics.clone();
         let source_load_context = SourceLoadContext {
             loader: loader.clone(),
             cache: cache.clone(),
@@ -168,7 +169,7 @@ where
                                     sfg.clone(),
                                     source_load_context.clone(),
                                 )
-                                .await.inspect_err(|e| error!("async source by sloader failed, error {e}"))
+                                .await
                             }
                             Loader::MultiLoader(_) => {
                                 Self::source_by_mloader(
@@ -176,11 +177,16 @@ where
                                     mfg.clone(),
                                     source_load_context.clone(),
                                 )
-                                .await.inspect_err(|e| error!("async source by mloader failed, error {e}"))
+                                .await
                             }
                         };
+                        if let Err(error) = result {
+                            error!(%error, "autocache: async source refresh failed");
+                            if let Some(metrics) = refresh_metrics.as_ref() {
+                                metrics.record("refresh", true, "source", cache.name());
+                            }
+                        }
                         Self::remove_pending_refresh_keys(&pending_refresh_keys, &task_keys);
-                        let _ = result;
                     }
                 }
             }
@@ -290,14 +296,17 @@ where
         Self::write_cache_entries(cache, entries, config.metrics).await;
     }
 
-    async fn invalidate_cache_keys(cache: &C, keys: &[K]) {
-        let _ = cache.mdel(keys).await.inspect_err(|error| {
+    async fn invalidate_cache_keys(cache: &C, keys: &[K], metrics: Option<MetricsContext>) {
+        if let Err(error) = cache.mdel(keys).await {
             error!(
                 key_count = keys.len(),
                 error = %error,
                 "autocache: failed to invalidate cache after source returned not found"
             );
-        });
+            if let Some(metrics) = metrics {
+                metrics.record("mdel", true, "source", cache.name());
+            }
+        }
     }
 
     async fn source_by_sloader(
@@ -335,6 +344,7 @@ where
                             Self::invalidate_cache_keys(
                                 loader_cache.as_ref(),
                                 std::slice::from_ref(&loader_key),
+                                loader_cache_fill_config.metrics.clone(),
                             )
                             .await;
                             return Ok(None);
@@ -427,7 +437,12 @@ where
             }
 
             if !missing_keys.is_empty() {
-                Self::invalidate_cache_keys(cache.as_ref(), &missing_keys).await;
+                Self::invalidate_cache_keys(
+                    cache.as_ref(),
+                    &missing_keys,
+                    cache_fill_config.metrics.clone(),
+                )
+                .await;
             }
 
             if !key_entries.is_empty() {

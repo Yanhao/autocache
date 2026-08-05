@@ -200,7 +200,9 @@ where
     /// Source reads use method `mget`. Failed or skipped automatic cache fills
     /// use method `mset` with `is_error=true` and `from="source"`. Automatic
     /// refreshes skipped due to queue saturation or worker unavailability use
-    /// method `refresh` with `is_error=true` and `from="source"`.
+    /// method `refresh` with `is_error=true` and `from="source"`. Background
+    /// source refresh failures use the same `refresh` metric. Failed automatic
+    /// invalidations use method `mdel` with `is_error=true` and `from="source"`.
     pub fn on_metrics(
         mut self,
         func: fn(method: &str, is_error: bool, ns: &str, from: &str, cache_name: &str),

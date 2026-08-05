@@ -19,7 +19,9 @@ static SOURCE_FIRST_METRIC_SOURCE: AtomicUsize = AtomicUsize::new(0);
 static CACHE_FIRST_METRIC_ERRORS: AtomicUsize = AtomicUsize::new(0);
 static CACHE_FIRST_METRIC_SOURCE: AtomicUsize = AtomicUsize::new(0);
 static ASYNC_CACHE_WRITE_METRIC_ERRORS: AtomicUsize = AtomicUsize::new(0);
-static ASYNC_REFRESH_METRIC_ERRORS: AtomicUsize = AtomicUsize::new(0);
+static ASYNC_REFRESH_QUEUE_METRIC_ERRORS: AtomicUsize = AtomicUsize::new(0);
+static ASYNC_SOURCE_REFRESH_METRIC_ERRORS: AtomicUsize = AtomicUsize::new(0);
+static CACHE_INVALIDATION_METRIC_ERRORS: AtomicUsize = AtomicUsize::new(0);
 
 fn source_first_metrics(_method: &str, is_error: bool, _ns: &str, from: &str, _cache_name: &str) {
     SOURCE_FIRST_METRIC_CALLS.fetch_add(1, Ordering::SeqCst);
@@ -52,9 +54,39 @@ fn async_cache_write_metrics(
     }
 }
 
-fn async_refresh_metrics(method: &str, is_error: bool, _ns: &str, _from: &str, _cache_name: &str) {
+fn async_refresh_queue_metrics(
+    method: &str,
+    is_error: bool,
+    _ns: &str,
+    _from: &str,
+    _cache_name: &str,
+) {
     if method == "refresh" && is_error {
-        ASYNC_REFRESH_METRIC_ERRORS.fetch_add(1, Ordering::SeqCst);
+        ASYNC_REFRESH_QUEUE_METRIC_ERRORS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn async_source_refresh_metrics(
+    method: &str,
+    is_error: bool,
+    _ns: &str,
+    _from: &str,
+    _cache_name: &str,
+) {
+    if method == "refresh" && is_error {
+        ASYNC_SOURCE_REFRESH_METRIC_ERRORS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn cache_invalidation_metrics(
+    method: &str,
+    is_error: bool,
+    _ns: &str,
+    _from: &str,
+    _cache_name: &str,
+) {
+    if method == "mdel" && is_error {
+        CACHE_INVALIDATION_METRIC_ERRORS.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -102,6 +134,30 @@ impl Cache for BlockingWriteCache {
 
     fn name(&self) -> &'static str {
         "blocking-write-cache"
+    }
+}
+
+#[derive(Clone)]
+struct FailingDeleteCache;
+
+impl Cache for FailingDeleteCache {
+    type Key = String;
+    type Value = Entry<String, String>;
+
+    async fn mget(&self, _keys: &[Self::Key]) -> anyhow::Result<Vec<Self::Value>> {
+        Ok(Vec::new())
+    }
+
+    async fn mset(&self, _kvs: &[(Self::Key, Self::Value)]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn mdel(&self, _keys: &[Self::Key]) -> anyhow::Result<()> {
+        anyhow::bail!("cache invalidation failed")
+    }
+
+    fn name(&self) -> &'static str {
+        "failing-delete-cache"
     }
 }
 
@@ -449,6 +505,23 @@ async fn test_cache_first_records_multi_loader_errors_and_not_found_source() {
     assert_eq!(CACHE_FIRST_METRIC_ERRORS.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn test_failed_automatic_invalidation_records_metric() {
+    CACHE_INVALIDATION_METRIC_ERRORS.store(0, Ordering::SeqCst);
+    let ac = AutoCache::builder()
+        .cache(FailingDeleteCache)
+        .source_first(true)
+        .on_metrics(cache_invalidation_metrics)
+        .single_loader(|_key: String, ()| async move { Ok(None::<String>) }.boxed())
+        .build()
+        .unwrap();
+
+    let result = ac.mget(&[("test-key".to_string(), ())]).await.unwrap();
+
+    assert!(result.is_empty());
+    assert_eq!(CACHE_INVALIDATION_METRIC_ERRORS.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn test_async_cache_fill_falls_back_without_tokio_runtime() {
     let source_calls = Arc::new(AtomicUsize::new(0));
@@ -664,7 +737,7 @@ async fn test_concurrent_stale_reads_enqueue_only_one_refresh_per_key() {
 async fn test_stale_read_does_not_wait_for_refresh_queue_capacity() {
     const REFRESH_QUEUE_CAPACITY: usize = 2;
 
-    ASYNC_REFRESH_METRIC_ERRORS.store(0, Ordering::SeqCst);
+    ASYNC_REFRESH_QUEUE_METRIC_ERRORS.store(0, Ordering::SeqCst);
     let refresh_started = Arc::new(tokio::sync::Notify::new());
     let loader_refresh_started = refresh_started.clone();
     let release_refresh = Arc::new(tokio::sync::Notify::new());
@@ -674,7 +747,7 @@ async fn test_stale_read_does_not_wait_for_refresh_queue_capacity() {
         .expire_time(std::time::Duration::ZERO)
         .use_expired_data(true)
         .async_refresh_queue_capacity(REFRESH_QUEUE_CAPACITY)
-        .on_metrics(async_refresh_metrics)
+        .on_metrics(async_refresh_queue_metrics)
         .single_loader(move |key: String, ()| {
             let loader_refresh_started = loader_refresh_started.clone();
             let loader_release_refresh = loader_release_refresh.clone();
@@ -715,8 +788,54 @@ async fn test_stale_read_does_not_wait_for_refresh_queue_capacity() {
     .unwrap();
 
     assert_eq!(result, vec![(stale_key, "stale-value".to_string())]);
-    assert_eq!(ASYNC_REFRESH_METRIC_ERRORS.load(Ordering::SeqCst), 1);
+    assert_eq!(ASYNC_REFRESH_QUEUE_METRIC_ERRORS.load(Ordering::SeqCst), 1);
     release_refresh.notify_one();
+}
+
+#[tokio::test]
+async fn test_async_source_refresh_failure_records_metric() {
+    ASYNC_SOURCE_REFRESH_METRIC_ERRORS.store(0, Ordering::SeqCst);
+    let source_calls = Arc::new(AtomicUsize::new(0));
+    let loader_calls = source_calls.clone();
+    let ac = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .expire_time(std::time::Duration::ZERO)
+        .use_expired_data(true)
+        .on_metrics(async_source_refresh_metrics)
+        .single_loader(move |key: String, ()| {
+            let loader_calls = loader_calls.clone();
+            async move {
+                if loader_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(Some("stale-value".to_string()))
+                } else {
+                    anyhow::bail!("source refresh failed for {key}")
+                }
+            }
+            .boxed()
+        })
+        .build()
+        .unwrap();
+
+    let key = "test-key".to_string();
+    assert_eq!(
+        ac.mget(&[(key.clone(), ())]).await.unwrap(),
+        vec![(key.clone(), "stale-value".to_string())]
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    assert_eq!(
+        ac.mget(&[(key.clone(), ())]).await.unwrap(),
+        vec![(key, "stale-value".to_string())]
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while ASYNC_SOURCE_REFRESH_METRIC_ERRORS.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(source_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(ASYNC_SOURCE_REFRESH_METRIC_ERRORS.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
