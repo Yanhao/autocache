@@ -10,6 +10,8 @@ type TestEntry = Entry<String, String>;
 struct TestCache {
     data: Arc<Mutex<BTreeMap<String, TestEntry>>>,
     get_calls: Arc<Mutex<Vec<Vec<String>>>>,
+    get_error: Arc<Mutex<Option<&'static str>>>,
+    del_error: Arc<Mutex<Option<&'static str>>>,
 }
 
 impl Cache for TestCache {
@@ -18,6 +20,9 @@ impl Cache for TestCache {
 
     async fn mget(&self, keys: &[Self::Key]) -> anyhow::Result<Vec<Self::Value>> {
         self.get_calls.lock().push(keys.to_vec());
+        if let Some(error) = *self.get_error.lock() {
+            anyhow::bail!(error);
+        }
 
         let data = self.data.lock();
         Ok(keys
@@ -35,6 +40,10 @@ impl Cache for TestCache {
     }
 
     async fn mdel(&self, keys: &[Self::Key]) -> anyhow::Result<()> {
+        if let Some(error) = *self.del_error.lock() {
+            anyhow::bail!(error);
+        }
+
         let mut data = self.data.lock();
         for key in keys {
             data.remove(key);
@@ -145,6 +154,50 @@ async fn test_mget_preserves_expired_l1_entry_when_l2_misses() {
     let entries = cache.mget(&["test-key".to_string()]).await.unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].value.as_deref(), Some("stale-value"));
+}
+
+#[tokio::test]
+async fn test_mget_preserves_expired_l1_entry_when_l2_fails() {
+    let l1 = TestCache::default();
+    l1.mset(&[(
+        "test-key".to_string(),
+        expired_entry("test-key", "stale-value"),
+    )])
+    .await
+    .unwrap();
+
+    let l2 = TestCache::default();
+    *l2.get_error.lock() = Some("L2 unavailable");
+    let cache = TwoLevelCache::new(l1, l2);
+
+    let entries = cache.mget(&["test-key".to_string()]).await.unwrap();
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].value.as_deref(), Some("stale-value"));
+}
+
+#[tokio::test]
+async fn test_mdel_invalidates_l1_when_l2_fails() {
+    let key = "test-key".to_string();
+    let l1 = TestCache::default();
+    l1.mset(&[(key.clone(), entry(&key, "l1-value"))])
+        .await
+        .unwrap();
+    let l1_observer = l1.clone();
+
+    let l2 = TestCache::default();
+    l2.mset(&[(key.clone(), entry(&key, "l2-value"))])
+        .await
+        .unwrap();
+    *l2.del_error.lock() = Some("L2 unavailable");
+    let l2_observer = l2.clone();
+    let cache = TwoLevelCache::new(l1, l2);
+
+    let error = cache.mdel(std::slice::from_ref(&key)).await.unwrap_err();
+
+    assert_eq!(error.to_string(), "L2 unavailable");
+    assert!(!l1_observer.data.lock().contains_key(&key));
+    assert!(l2_observer.data.lock().contains_key(&key));
 }
 
 #[cfg(all(feature = "localcache", feature = "rediscache"))]

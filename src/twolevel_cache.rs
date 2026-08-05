@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+use tracing::warn;
+
 use crate::{cache::Cache, entry::EntryTrait};
 
 pub struct TwoLevelCache<K, V, L1, L2> {
@@ -50,7 +52,18 @@ where
             return Ok(l1_entries);
         }
 
-        let mut l2_entries = self.redis_cache.mget(&l1_missed_keys).await?;
+        let mut l2_entries = match self.redis_cache.mget(&l1_missed_keys).await {
+            Ok(entries) => entries,
+            Err(error) => {
+                warn!(
+                    cache = self.redis_cache.name(),
+                    missed_key_count = l1_missed_keys.len(),
+                    error = %error,
+                    "autocache: L2 cache read failed; falling back to available L1 entries"
+                );
+                return Ok(l1_entries);
+            }
+        };
         let fresh_l2_entries = l2_entries
             .iter()
             .filter(|entry| !entry.is_expired())
@@ -80,8 +93,11 @@ where
     }
 
     async fn mdel(&self, keys: &[Self::Key]) -> anyhow::Result<()> {
-        self.redis_cache.mdel(keys).await?;
-        self.local_cache.mdel(keys).await?;
+        let l1_result = self.local_cache.mdel(keys).await;
+        let l2_result = self.redis_cache.mdel(keys).await;
+
+        l1_result?;
+        l2_result?;
 
         Ok(())
     }
