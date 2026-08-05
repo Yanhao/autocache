@@ -67,6 +67,10 @@ where
 
     /// Sets a loader for individual cache keys.
     ///
+    /// `Ok(None)` is an authoritative not-found result. In source-first mode,
+    /// AutoCache will not fall back to a previously cached value for that key.
+    /// Use `Err` when the source could not determine whether the key exists.
+    ///
     /// For a given `K`, the loader result must not vary based on `E`. Any input
     /// that changes the cached value must be represented in `K` itself.
     pub fn single_loader(
@@ -78,6 +82,11 @@ where
     }
 
     /// Sets a loader for batches of cache keys.
+    ///
+    /// Omitting a requested key from the returned vector is an authoritative
+    /// not-found result for that key. In source-first mode, AutoCache will not
+    /// fall back to a previously cached value. Return `Err` when the batch
+    /// result is incomplete or otherwise cannot be trusted.
     ///
     /// For a given `K`, the loader result must not vary based on `E`. Any input
     /// that changes the cached value must be represented in `K` itself.
@@ -119,6 +128,10 @@ where
         self
     }
 
+    /// Controls whether authoritative not-found results are cached.
+    ///
+    /// This setting affects only negative-cache storage, not the value returned
+    /// to the caller.
     pub fn cache_none(mut self, t: bool) -> Self {
         self.cache_none = t;
         self

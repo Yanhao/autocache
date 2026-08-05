@@ -151,6 +151,63 @@ async fn test_request_scoped_expired_data_falls_back_to_sync_source_without_work
     assert_eq!(source_calls.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test]
+async fn test_source_first_none_does_not_fall_back_to_expired_cache_entry() {
+    let ac = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .expire_time(std::time::Duration::ZERO)
+        .source_first(true)
+        .single_loader(|_key: String, ()| async move { Ok(None) }.boxed())
+        .build()
+        .unwrap();
+
+    let key = "test-key".to_string();
+    ac.mset(&[(key.clone(), "stale-value".to_string())])
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+    let result = ac.mget(&[(key, ())]).await.unwrap();
+
+    assert!(result.is_empty());
+}
+
+#[tokio::test]
+async fn test_source_first_honors_request_scoped_negative_caching() {
+    let source_calls = Arc::new(AtomicUsize::new(0));
+    let loader_calls = source_calls.clone();
+    let ac = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .single_loader(move |_key: String, ()| {
+            let loader_calls = loader_calls.clone();
+            async move {
+                loader_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(None::<String>)
+            }
+            .boxed()
+        })
+        .build()
+        .unwrap();
+
+    let key = "test-key".to_string();
+    let first = ac
+        .mget_with_option(
+            &[(key.clone(), ())],
+            Options {
+                source_first: Some(true),
+                cache_none: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let second = ac.mget(&[(key, ())]).await.unwrap();
+
+    assert!(first.is_empty());
+    assert!(second.is_empty());
+    assert_eq!(source_calls.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_stale_reads_enqueue_only_one_refresh_per_key() {
     let source_calls = Arc::new(AtomicUsize::new(0));
