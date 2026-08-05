@@ -55,6 +55,14 @@ fn entry(key: &str, value: &str) -> TestEntry {
     }
 }
 
+fn expired_entry(key: &str, value: &str) -> TestEntry {
+    Entry {
+        key: key.to_string(),
+        value: Some(value.to_string()),
+        expire_at_ms: Some(0),
+    }
+}
+
 #[tokio::test]
 async fn test_mget_loads_only_l1_misses_from_l2_and_warms_l1() {
     let l1 = TestCache::default();
@@ -86,6 +94,57 @@ async fn test_mget_loads_only_l1_misses_from_l2_and_warms_l1() {
     let entries = cache.mget(&keys).await.unwrap();
     assert_eq!(entries.len(), 2);
     assert_eq!(l2_observer.get_calls.lock().len(), 1);
+}
+
+#[tokio::test]
+async fn test_mget_prefers_l2_when_l1_entry_is_expired() {
+    let l1 = TestCache::default();
+    l1.mset(&[(
+        "test-key".to_string(),
+        expired_entry("test-key", "stale-value"),
+    )])
+    .await
+    .unwrap();
+
+    let l2 = TestCache::default();
+    l2.mset(&[("test-key".to_string(), entry("test-key", "fresh-value"))])
+        .await
+        .unwrap();
+
+    let l2_observer = l2.clone();
+    let cache = TwoLevelCache::new(l1, l2);
+    let keys = vec!["test-key".to_string()];
+
+    let entries = cache.mget(&keys).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].value.as_deref(), Some("fresh-value"));
+    assert_eq!(
+        l2_observer.get_calls.lock().clone(),
+        vec![vec!["test-key".to_string()]]
+    );
+
+    let entries = cache.mget(&keys).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].value.as_deref(), Some("fresh-value"));
+    assert_eq!(l2_observer.get_calls.lock().len(), 1);
+}
+
+#[tokio::test]
+async fn test_mget_preserves_expired_l1_entry_when_l2_misses() {
+    let l1 = TestCache::default();
+    l1.mset(&[(
+        "test-key".to_string(),
+        expired_entry("test-key", "stale-value"),
+    )])
+    .await
+    .unwrap();
+
+    let l2 = TestCache::default();
+    let cache = TwoLevelCache::new(l1, l2);
+
+    let entries = cache.mget(&["test-key".to_string()]).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].value.as_deref(), Some("stale-value"));
 }
 
 #[cfg(all(feature = "localcache", feature = "rediscache"))]

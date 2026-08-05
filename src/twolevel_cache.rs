@@ -36,6 +36,7 @@ where
         let mut l1_entries = self.local_cache.mget(keys).await?;
         let l1_hit_keys = l1_entries
             .iter()
+            .filter(|entry| !entry.is_expired())
             .map(EntryTrait::get_key)
             .collect::<BTreeSet<_>>();
         let l1_missed_keys = keys
@@ -45,21 +46,26 @@ where
             .collect::<Vec<_>>();
 
         if l1_missed_keys.is_empty() {
+            l1_entries.retain(|entry| !entry.is_expired());
             return Ok(l1_entries);
         }
 
         let mut l2_entries = self.redis_cache.mget(&l1_missed_keys).await?;
-        if !l2_entries.is_empty() {
-            self.local_cache
-                .mset(
-                    &l2_entries
-                        .clone()
-                        .into_iter()
-                        .map(|e| (e.get_key(), e))
-                        .collect::<Vec<_>>(),
-                )
-                .await?;
+        let fresh_l2_entries = l2_entries
+            .iter()
+            .filter(|entry| !entry.is_expired())
+            .cloned()
+            .map(|entry| (entry.get_key(), entry))
+            .collect::<Vec<_>>();
+        if !fresh_l2_entries.is_empty() {
+            self.local_cache.mset(&fresh_l2_entries).await?;
         }
+
+        let l2_hit_keys = l2_entries
+            .iter()
+            .map(EntryTrait::get_key)
+            .collect::<BTreeSet<_>>();
+        l1_entries.retain(|entry| !entry.is_expired() || !l2_hit_keys.contains(&entry.get_key()));
 
         l1_entries.append(&mut l2_entries);
 
