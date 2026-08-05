@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::pending, sync::Arc};
 
 use arc_swap::ArcSwapOption;
 use futures::FutureExt;
@@ -72,6 +72,111 @@ async fn test_cleanup_worker_starts_without_expire_listener() {
 
     cache.start().unwrap();
     cache.stop().unwrap();
+}
+
+#[tokio::test]
+async fn test_cleanup_worker_can_restart_after_stop() {
+    let listener_calls = Arc::new(tokio::sync::Semaphore::new(0));
+    let observed_listener_calls = listener_calls.clone();
+    let cache = TtlCache::new_with_expire_listener(None, move |_entries| {
+        let listener_calls = listener_calls.clone();
+        async move {
+            listener_calls.add_permits(1);
+        }
+        .boxed()
+    });
+    let key = "test-key".to_string();
+    cache
+        .mset(&[(
+            key.clone(),
+            Entry {
+                key,
+                value: Some("test-value".to_string()),
+                expire_at_ms: Some(0),
+            },
+        )])
+        .await
+        .unwrap();
+
+    cache.start().unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        observed_listener_calls.clone().acquire_owned(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .forget();
+    cache.stop().unwrap();
+
+    cache.start().unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        observed_listener_calls.acquire_owned(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .forget();
+    cache.stop().unwrap();
+}
+
+struct ListenerDropSignal(Arc<tokio::sync::Semaphore>);
+
+impl Drop for ListenerDropSignal {
+    fn drop(&mut self) {
+        self.0.add_permits(1);
+    }
+}
+
+#[tokio::test]
+async fn test_dropping_cache_cancels_cleanup_worker() {
+    let listener_started = Arc::new(tokio::sync::Semaphore::new(0));
+    let listener_dropped = Arc::new(tokio::sync::Semaphore::new(0));
+    let observed_listener_started = listener_started.clone();
+    let observed_listener_dropped = listener_dropped.clone();
+    let cache = TtlCache::new_with_expire_listener(None, move |_entries| {
+        let listener_started = listener_started.clone();
+        let listener_dropped = listener_dropped.clone();
+        async move {
+            let _drop_signal = ListenerDropSignal(listener_dropped);
+            listener_started.add_permits(1);
+            pending::<()>().await;
+        }
+        .boxed()
+    });
+    let key = "test-key".to_string();
+    cache
+        .mset(&[(
+            key.clone(),
+            Entry {
+                key,
+                value: Some("test-value".to_string()),
+                expire_at_ms: Some(0),
+            },
+        )])
+        .await
+        .unwrap();
+
+    cache.start().unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        observed_listener_started.acquire_owned(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .forget();
+
+    drop(cache);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        observed_listener_dropped.acquire_owned(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .forget();
 }
 
 #[test]
