@@ -11,6 +11,7 @@ pub mod local_cache;
 mod options;
 #[cfg(feature = "rediscache")]
 pub mod redis_cache;
+mod singleflight;
 #[cfg(feature = "ttlcache")]
 pub mod ttl_cache;
 #[cfg(feature = "twolevelcache")]

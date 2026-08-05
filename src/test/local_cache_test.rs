@@ -19,6 +19,18 @@ struct Item {
     message: String,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TenantKey {
+    tenant: &'static str,
+    id: &'static str,
+}
+
+impl AsRef<str> for TenantKey {
+    fn as_ref(&self) -> &str {
+        self.id
+    }
+}
+
 #[tokio::test]
 async fn test_builder() {
     tracing_subscriber::fmt::init();
@@ -196,6 +208,150 @@ async fn test_concurrent_stale_reads_enqueue_only_one_refresh_per_key() {
 
     release_refresh.notify_one();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(source_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_singleflight_uses_the_complete_typed_key_identity() {
+    let source_calls = Arc::new(AtomicUsize::new(0));
+    let loader_calls = source_calls.clone();
+    let loaders_started = Arc::new(tokio::sync::Semaphore::new(0));
+    let loader_started = loaders_started.clone();
+    let release_loaders = Arc::new(tokio::sync::Semaphore::new(0));
+    let loader_release = release_loaders.clone();
+
+    let ac = Arc::new(
+        AutoCache::builder()
+            .cache(LocalCache::new(LocalCacheOption::default()))
+            .single_loader(move |key: TenantKey, ()| {
+                let loader_calls = loader_calls.clone();
+                let loader_started = loader_started.clone();
+                let loader_release = loader_release.clone();
+                async move {
+                    loader_calls.fetch_add(1, Ordering::SeqCst);
+                    loader_started.add_permits(1);
+                    loader_release.acquire_owned().await.unwrap().forget();
+                    Ok(Some(format!("{}:{}", key.tenant, key.id)))
+                }
+                .boxed()
+            })
+            .build()
+            .unwrap(),
+    );
+
+    let tenant_a_key = TenantKey {
+        tenant: "tenant-a",
+        id: "shared-id",
+    };
+    let tenant_b_key = TenantKey {
+        tenant: "tenant-b",
+        id: "shared-id",
+    };
+
+    let tenant_a_read = {
+        let ac = ac.clone();
+        let key = tenant_a_key.clone();
+        tokio::spawn(async move { ac.mget(&[(key, ())]).await.unwrap() })
+    };
+    let tenant_b_read = {
+        let ac = ac.clone();
+        let key = tenant_b_key.clone();
+        tokio::spawn(async move { ac.mget(&[(key, ())]).await.unwrap() })
+    };
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        loaders_started.acquire_many(2),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .forget();
+    release_loaders.add_permits(2);
+
+    assert_eq!(
+        tenant_a_read.await.unwrap(),
+        vec![(tenant_a_key, "tenant-a:shared-id".to_string())]
+    );
+    assert_eq!(
+        tenant_b_read.await.unwrap(),
+        vec![(tenant_b_key, "tenant-b:shared-id".to_string())]
+    );
+    assert_eq!(source_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multi_loader_batch_identity_does_not_use_delimited_strings() {
+    let source_calls = Arc::new(AtomicUsize::new(0));
+    let loader_calls = source_calls.clone();
+    let loaders_started = Arc::new(tokio::sync::Semaphore::new(0));
+    let loader_started = loaders_started.clone();
+    let release_loaders = Arc::new(tokio::sync::Semaphore::new(0));
+    let loader_release = release_loaders.clone();
+
+    let ac = Arc::new(
+        AutoCache::builder()
+            .cache(LocalCache::new(LocalCacheOption::default()))
+            .multi_loader(move |keys: Vec<(String, ())>| {
+                let loader_calls = loader_calls.clone();
+                let loader_started = loader_started.clone();
+                let loader_release = loader_release.clone();
+                async move {
+                    loader_calls.fetch_add(1, Ordering::SeqCst);
+                    loader_started.add_permits(1);
+                    loader_release.acquire_owned().await.unwrap().forget();
+                    Ok(keys
+                        .into_iter()
+                        .map(|(key, ())| {
+                            let value = format!("value:{key}");
+                            (key, value)
+                        })
+                        .collect())
+                }
+                .boxed()
+            })
+            .build()
+            .unwrap(),
+    );
+
+    let first_keys = vec![("a,b".to_string(), ()), ("c".to_string(), ())];
+    let second_keys = vec![("a".to_string(), ()), ("b,c".to_string(), ())];
+
+    let first_read = {
+        let ac = ac.clone();
+        let keys = first_keys.clone();
+        tokio::spawn(async move { ac.mget(&keys).await.unwrap() })
+    };
+    let second_read = {
+        let ac = ac.clone();
+        let keys = second_keys.clone();
+        tokio::spawn(async move { ac.mget(&keys).await.unwrap() })
+    };
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        loaders_started.acquire_many(2),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .forget();
+    release_loaders.add_permits(2);
+
+    assert_eq!(
+        first_read.await.unwrap(),
+        vec![
+            ("a,b".to_string(), "value:a,b".to_string()),
+            ("c".to_string(), "value:c".to_string()),
+        ]
+    );
+    assert_eq!(
+        second_read.await.unwrap(),
+        vec![
+            ("a".to_string(), "value:a".to_string()),
+            ("b,c".to_string(), "value:b,c".to_string()),
+        ]
+    );
     assert_eq!(source_calls.load(Ordering::SeqCst), 2);
 }
 
