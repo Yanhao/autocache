@@ -177,6 +177,6 @@ fn test_builder_returns_errors_instead_of_panicking_for_invalid_configuration() 
         .build();
     assert_eq!(
         missing_runtime.err().unwrap().to_string(),
-        "a Tokio runtime is required when background refresh is enabled"
+        "a Tokio runtime is required for background tasks"
     );
 }
