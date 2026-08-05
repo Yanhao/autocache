@@ -277,6 +277,29 @@ async fn test_multi_loader_returns_source_values_when_cache_fill_fails() {
 }
 
 #[tokio::test]
+async fn test_not_found_returns_success_when_cache_invalidation_fails() {
+    let key = "test-key".to_string();
+    let l1 = TestCache::default();
+    l1.mset(&[(key.clone(), entry(&key, "stale-value"))])
+        .await
+        .unwrap();
+    *l1.del_error.lock() = Some("L1 delete unavailable");
+    let l1_observer = l1.clone();
+
+    let ac = AutoCache::builder()
+        .cache(TwoLevelCache::new(l1, TestCache::default()))
+        .source_first(true)
+        .single_loader(|_key: String, ()| async move { Ok(None::<String>) }.boxed())
+        .build()
+        .unwrap();
+
+    let result = ac.mget(&[(key.clone(), ())]).await.unwrap();
+
+    assert!(result.is_empty());
+    assert!(l1_observer.data.lock().contains_key(&key));
+}
+
+#[tokio::test]
 async fn test_explicit_mset_still_propagates_cache_write_errors() {
     let ac = AutoCache::builder()
         .cache(unavailable_two_level_cache())

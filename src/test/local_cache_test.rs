@@ -187,6 +187,84 @@ async fn test_source_first_none_does_not_fall_back_to_expired_cache_entry() {
 }
 
 #[tokio::test]
+async fn test_single_loader_not_found_invalidates_existing_positive_cache() {
+    let source_calls = Arc::new(AtomicUsize::new(0));
+    let loader_calls = source_calls.clone();
+    let ac = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .single_loader(move |_key: String, ()| {
+            let loader_calls = loader_calls.clone();
+            async move {
+                loader_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(None::<String>)
+            }
+            .boxed()
+        })
+        .build()
+        .unwrap();
+
+    let key = "test-key".to_string();
+    ac.mset(&[(key.clone(), "stale-value".to_string())])
+        .await
+        .unwrap();
+
+    let source_first = ac
+        .mget_with_option(
+            &[(key.clone(), ())],
+            Options {
+                source_first: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let cache_first = ac.mget(&[(key, ())]).await.unwrap();
+
+    assert!(source_first.is_empty());
+    assert!(cache_first.is_empty());
+    assert_eq!(source_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn test_multi_loader_not_found_invalidates_existing_positive_cache() {
+    let source_calls = Arc::new(AtomicUsize::new(0));
+    let loader_calls = source_calls.clone();
+    let ac = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .multi_loader(move |_keys: Vec<(String, ())>| {
+            let loader_calls = loader_calls.clone();
+            async move {
+                loader_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::<(String, String)>::new())
+            }
+            .boxed()
+        })
+        .build()
+        .unwrap();
+
+    let key = "test-key".to_string();
+    ac.mset(&[(key.clone(), "stale-value".to_string())])
+        .await
+        .unwrap();
+
+    let source_first = ac
+        .mget_with_option(
+            &[(key.clone(), ())],
+            Options {
+                source_first: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let cache_first = ac.mget(&[(key, ())]).await.unwrap();
+
+    assert!(source_first.is_empty());
+    assert!(cache_first.is_empty());
+    assert_eq!(source_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn test_source_first_honors_request_scoped_negative_caching() {
     let source_calls = Arc::new(AtomicUsize::new(0));
     let loader_calls = source_calls.clone();

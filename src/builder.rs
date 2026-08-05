@@ -131,7 +131,8 @@ where
     /// Controls whether authoritative not-found results are cached.
     ///
     /// This setting affects only negative-cache storage, not the value returned
-    /// to the caller.
+    /// to the caller. When disabled, an authoritative not-found result removes
+    /// any existing positive cache entry without storing a negative entry.
     pub fn cache_none(mut self, t: bool) -> Self {
         self.cache_none = t;
         self

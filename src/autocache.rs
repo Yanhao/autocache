@@ -168,6 +168,16 @@ where
             .inspect_err(|e| error!("mset cache failed, error: {e}"));
     }
 
+    async fn invalidate_cache_keys(cache: &C, keys: &[K]) {
+        let _ = cache.mdel(keys).await.inspect_err(|error| {
+            error!(
+                key_count = keys.len(),
+                error = %error,
+                "autocache: failed to invalidate cache after source returned not found"
+            );
+        });
+    }
+
     async fn source_by_sloader(
         keys: &[(K, E)],
         loader: Arc<Loader<K, V, E>>,
@@ -196,6 +206,11 @@ where
                         debug!(msg = "autocache: source value is none", key = ?loader_key);
 
                         if !cache_none {
+                            Self::invalidate_cache_keys(
+                                loader_cache.as_ref(),
+                                std::slice::from_ref(&loader_key),
+                            )
+                            .await;
                             return Ok(None);
                         }
                     }
@@ -258,42 +273,43 @@ where
 
         mfg.work(batch_key, async move {
             let kvs = (mloader)(loader_keys.clone()).await?;
-            let key_entries = loader_keys
-                .iter()
-                .filter_map(|k| {
-                    for kv in kvs.iter() {
-                        if kv.0 == k.0 {
-                            return Some((
-                                kv.0.clone(),
-                                Entry {
-                                    key: kv.0.clone(),
-                                    value: Some(kv.1.clone()),
-                                    expire_at_ms: Some(
-                                        (Utc::now()
-                                            + chrono::Duration::from_std(expire_time).unwrap())
-                                        .timestamp_millis(),
-                                    ),
-                                },
-                            ));
-                        }
-                    }
-                    cache_none.then(|| {
-                        (
-                            k.0.clone(),
-                            Entry {
-                                key: k.0.clone(),
-                                value: None,
-                                expire_at_ms: Some(
-                                    (Utc::now()
-                                        + chrono::Duration::from_std(none_value_expire_time)
-                                            .unwrap())
+            let mut key_entries = Vec::with_capacity(loader_keys.len());
+            let mut missing_keys = Vec::new();
+
+            for key in &loader_keys {
+                if let Some((loaded_key, value)) = kvs.iter().find(|kv| kv.0 == key.0) {
+                    key_entries.push((
+                        loaded_key.clone(),
+                        Entry {
+                            key: loaded_key.clone(),
+                            value: Some(value.clone()),
+                            expire_at_ms: Some(
+                                (Utc::now() + chrono::Duration::from_std(expire_time).unwrap())
                                     .timestamp_millis(),
-                                ),
-                            },
-                        )
-                    })
-                })
-                .collect::<Vec<_>>();
+                            ),
+                        },
+                    ));
+                } else if cache_none {
+                    key_entries.push((
+                        key.0.clone(),
+                        Entry {
+                            key: key.0.clone(),
+                            value: None,
+                            expire_at_ms: Some(
+                                (Utc::now()
+                                    + chrono::Duration::from_std(none_value_expire_time).unwrap())
+                                .timestamp_millis(),
+                            ),
+                        },
+                    ));
+                } else {
+                    missing_keys.push(key.0.clone());
+                }
+            }
+
+            if !missing_keys.is_empty() {
+                Self::invalidate_cache_keys(cache.as_ref(), &missing_keys).await;
+            }
 
             if !key_entries.is_empty() {
                 Self::set_cache_entries(cache, key_entries.clone(), async_set_cache).await;
