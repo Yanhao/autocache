@@ -7,6 +7,18 @@ use futures::future::BoxFuture;
 
 use crate::{cache::Cache, entry::EntryTrait, error::AutoCacheError};
 
+type ExpireListener<K, V> = Box<dyn Fn(Vec<(K, V)>) -> BoxFuture<'static, ()> + Send + Sync>;
+
+struct CleanupWorker {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for CleanupWorker {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 #[derive(Clone)]
 struct CacheItem<V> {
     time_to_remove_ms: Option<i64>,
@@ -24,10 +36,9 @@ pub struct TtlCache<K, V> {
     data: Arc<parking_lot::RwLock<im::OrdMap<K, CacheItem<V>>>>,
 
     ttl: Option<std::time::Duration>,
-    expire_listener:
-        ArcSwapOption<Box<dyn Fn(Vec<(K, V)>) -> BoxFuture<'static, ()> + Send + Sync>>,
+    expire_listener: ArcSwapOption<ExpireListener<K, V>>,
 
-    stop_notifier: ArcSwapOption<tokio::sync::Notify>,
+    cleanup_worker: parking_lot::Mutex<Option<CleanupWorker>>,
 }
 
 impl<K, V> TtlCache<K, V> {
@@ -37,7 +48,7 @@ impl<K, V> TtlCache<K, V> {
             ttl,
             expire_listener: None.into(),
 
-            stop_notifier: None.into(),
+            cleanup_worker: parking_lot::Mutex::new(None),
         }
     }
 
@@ -50,7 +61,7 @@ impl<K, V> TtlCache<K, V> {
             ttl,
             expire_listener: ArcSwapOption::new(Some(Arc::new(Box::new(listener)))),
 
-            stop_notifier: None.into(),
+            cleanup_worker: parking_lot::Mutex::new(None),
         }
     }
 
@@ -58,14 +69,26 @@ impl<K, V> TtlCache<K, V> {
         &self,
         listener: impl Fn(Vec<(K, V)>) -> BoxFuture<'static, ()> + Send + Sync + 'static,
     ) -> Result<()> {
-        if self.stop_notifier.load().is_some() {
+        let cleanup_worker = self.cleanup_worker.lock();
+        if cleanup_worker.is_some() {
             bail!("expire listener already set");
         }
 
         self.expire_listener
             .store(Some(Arc::new(Box::new(listener))));
+        drop(cleanup_worker);
 
         Ok(())
+    }
+
+    fn stop_cleanup_worker(&self) {
+        self.cleanup_worker.lock().take();
+    }
+}
+
+impl<K, V> Drop for TtlCache<K, V> {
+    fn drop(&mut self) {
+        self.stop_cleanup_worker();
     }
 }
 
@@ -113,7 +136,7 @@ where
             .transpose()?;
 
         let mut data = self.data.write();
-        for kv in kvs.into_iter() {
+        for kv in kvs {
             data.insert(
                 kv.0.clone(),
                 CacheItem {
@@ -147,7 +170,7 @@ where
 {
     async fn check_expires(
         cache: Arc<parking_lot::RwLock<im::OrdMap<K, CacheItem<V>>>>,
-        expire_listener: Arc<Box<dyn Fn(Vec<(K, V)>) -> BoxFuture<'static, ()> + Send + Sync>>,
+        expire_listener: Arc<ExpireListener<K, V>>,
     ) {
         let cache_snap = cache.read().clone();
 
@@ -188,7 +211,11 @@ where
     }
 
     pub fn start(&self) -> Result<()> {
-        if self.stop_notifier.load().is_some() {
+        let mut cleanup_worker = self.cleanup_worker.lock();
+        if cleanup_worker
+            .as_ref()
+            .is_some_and(|worker| !worker.task.is_finished())
+        {
             return Ok(());
         }
 
@@ -196,38 +223,26 @@ where
             .map_err(|_| AutoCacheError::RuntimeUnavailable)?;
         let listener = self.expire_listener.load_full();
 
-        let notifier = Arc::new(tokio::sync::Notify::new());
-        self.stop_notifier.store(Some(notifier.clone()));
-
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let cache = self.data.clone();
-        runtime.spawn(async move {
+        let task = runtime.spawn(async move {
             loop {
-                tokio::select! {
-                    _ = ticker.tick()=> {
-                        Self::cleanup_ttl(cache.clone());
-                        if let Some(listener) = listener.as_ref() {
-                            Self::check_expires(cache.clone(), listener.clone()).await;
-                        }
-                    }
-
-                    _ = notifier.notified() => {
-                        return;
-                    }
+                ticker.tick().await;
+                Self::cleanup_ttl(cache.clone());
+                if let Some(listener) = listener.as_ref() {
+                    Self::check_expires(cache.clone(), listener.clone()).await;
                 }
             }
         });
+        *cleanup_worker = Some(CleanupWorker { task });
 
         Ok(())
     }
 
     pub fn stop(&self) -> Result<()> {
-        if let Some(s) = self.stop_notifier.load().as_ref() {
-            s.notify_one();
-        }
-
+        self.stop_cleanup_worker();
         Ok(())
     }
 }

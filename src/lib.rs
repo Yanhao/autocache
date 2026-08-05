@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 mod autocache;
 mod builder;
 mod cache;

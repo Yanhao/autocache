@@ -6,9 +6,16 @@ use anyhow::Result;
 use futures::future::BoxFuture;
 
 use crate::{
-    autocache::AutoCache, cache::Cache, entry::Entry, error::AutoCacheError, loader::Loader,
+    autocache::{AutoCache, MetricsCallback},
+    cache::Cache,
+    entry::Entry,
+    error::AutoCacheError,
+    loader::Loader,
     singleflight::Group,
 };
+
+const DEFAULT_MAX_CONCURRENT_ASYNC_CACHE_WRITES: usize = 64;
+const DEFAULT_ASYNC_REFRESH_QUEUE_CAPACITY: usize = 512;
 
 pub struct AutoCacheBuilder<K, V, C, E>
 where
@@ -25,13 +32,26 @@ where
     pub(crate) source_first: bool,
     pub(crate) max_batch_size: usize,
     pub(crate) async_set_cache: bool,
+    pub(crate) max_concurrent_async_cache_writes: usize,
+    pub(crate) async_refresh_queue_capacity: usize,
     pub(crate) manually_refresh: bool,
 
     pub(crate) use_expired_data: bool,
     pub(crate) namespace: Option<String>,
 
-    pub(crate) on_metrics:
-        Option<fn(method: &str, is_error: bool, ns: &str, from: &str, cache_name: &str)>,
+    pub(crate) on_metrics: Option<MetricsCallback>,
+}
+
+impl<K, V, C, E> Default for AutoCacheBuilder<K, V, C, E>
+where
+    K: Clone + Debug + Eq + Hash + Sync + Send + 'static,
+    V: Clone + Debug + Sync + Send + 'static,
+    C: Cache<Key = K, Value = Entry<K, V>> + Sync + Send + 'static,
+    E: Clone + Debug + Sync + Send + 'static,
+{
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<K, V, C, E> AutoCacheBuilder<K, V, C, E>
@@ -49,6 +69,8 @@ where
             none_value_expire_time: std::time::Duration::from_secs(60),
             max_batch_size: 100,
             async_set_cache: false,
+            max_concurrent_async_cache_writes: DEFAULT_MAX_CONCURRENT_ASYNC_CACHE_WRITES,
+            async_refresh_queue_capacity: DEFAULT_ASYNC_REFRESH_QUEUE_CAPACITY,
             cache_none: false,
 
             source_first: false,
@@ -67,6 +89,10 @@ where
 
     /// Sets a loader for individual cache keys.
     ///
+    /// `Ok(None)` is an authoritative not-found result. In source-first mode,
+    /// AutoCache will not fall back to a previously cached value for that key.
+    /// Use `Err` when the source could not determine whether the key exists.
+    ///
     /// For a given `K`, the loader result must not vary based on `E`. Any input
     /// that changes the cached value must be represented in `K` itself.
     pub fn single_loader(
@@ -78,6 +104,11 @@ where
     }
 
     /// Sets a loader for batches of cache keys.
+    ///
+    /// Omitting a requested key from the returned vector is an authoritative
+    /// not-found result for that key. In source-first mode, AutoCache will not
+    /// fall back to a previously cached value. Return `Err` when the batch
+    /// result is incomplete or otherwise cannot be trusted.
     ///
     /// For a given `K`, the loader result must not vary based on `E`. Any input
     /// that changes the cached value must be represented in `K` itself.
@@ -114,11 +145,41 @@ where
         self
     }
 
+    /// Sets the maximum number of pending asynchronous refresh batches.
+    ///
+    /// The default is 512. Automatic stale-data refreshes are skipped when the
+    /// queue is full, while explicit [`AutoCache::refresh`] calls wait for
+    /// capacity. The value must be greater than zero.
+    pub fn async_refresh_queue_capacity(mut self, capacity: usize) -> Self {
+        self.async_refresh_queue_capacity = capacity;
+        self
+    }
+
+    /// Enables best-effort asynchronous cache fills.
+    ///
+    /// Async fills are unordered and limited by
+    /// [`Self::max_concurrent_async_cache_writes`]. A fill is skipped when the
+    /// limit is reached. If no Tokio runtime is available, the fill runs
+    /// synchronously instead.
     pub fn async_set_cache(mut self, t: bool) -> Self {
         self.async_set_cache = t;
         self
     }
 
+    /// Sets the maximum number of concurrent best-effort async cache writes.
+    ///
+    /// The default is 64. Additional fills are skipped while the limit is
+    /// reached. The value must be greater than zero.
+    pub fn max_concurrent_async_cache_writes(mut self, limit: usize) -> Self {
+        self.max_concurrent_async_cache_writes = limit;
+        self
+    }
+
+    /// Controls whether authoritative not-found results are cached.
+    ///
+    /// This setting affects only negative-cache storage, not the value returned
+    /// to the caller. When disabled, an authoritative not-found result removes
+    /// any existing positive cache entry without storing a negative entry.
     pub fn cache_none(mut self, t: bool) -> Self {
         self.cache_none = t;
         self
@@ -134,6 +195,14 @@ where
         self
     }
 
+    /// Registers a callback for cache operation metrics.
+    ///
+    /// Source reads use method `mget`. Failed or skipped automatic cache fills
+    /// use method `mset` with `is_error=true` and `from="source"`. Automatic
+    /// refreshes skipped due to queue saturation or worker unavailability use
+    /// method `refresh` with `is_error=true` and `from="source"`. Background
+    /// source refresh failures use the same `refresh` metric. Failed automatic
+    /// invalidations use method `mdel` with `is_error=true` and `from="source"`.
     pub fn on_metrics(
         mut self,
         func: fn(method: &str, is_error: bool, ns: &str, from: &str, cache_name: &str),
@@ -148,6 +217,12 @@ where
         if self.max_batch_size == 0 {
             return Err(AutoCacheError::InvalidMaxBatchSize.into());
         }
+        if self.max_concurrent_async_cache_writes == 0 {
+            return Err(AutoCacheError::InvalidMaxConcurrentAsyncCacheWrites.into());
+        }
+        if self.async_refresh_queue_capacity == 0 {
+            return Err(AutoCacheError::InvalidAsyncRefreshQueueCapacity.into());
+        }
 
         let mut ac = AutoCache::<K, V, C, E> {
             cache_store: Arc::new(cache),
@@ -159,6 +234,10 @@ where
             source_first: self.source_first,
             max_batch_size: self.max_batch_size,
             async_set_cache: self.async_set_cache,
+            async_cache_write_permits: Arc::new(tokio::sync::Semaphore::new(
+                self.max_concurrent_async_cache_writes,
+            )),
+            async_refresh_queue_capacity: self.async_refresh_queue_capacity,
             use_expired_data: self.use_expired_data,
             manually_refresh: self.manually_refresh,
 

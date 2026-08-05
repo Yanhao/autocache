@@ -40,10 +40,13 @@ async fn test_mset_propagates_encode_errors() {
 }
 
 #[tokio::test]
+#[ignore = "requires a Redis server"]
 async fn test_redis_cache() {
-    tracing_subscriber::fmt::init();
+    let _ = tracing_subscriber::fmt::try_init();
 
-    let redis_cli = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let redis_url =
+        std::env::var("AUTOCACHE_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+    let redis_cli = redis::Client::open(redis_url).unwrap();
 
     let ac = AutoCache::builder()
         .cache(RedisCache::new(redis_cli))
@@ -61,6 +64,14 @@ async fn test_redis_cache() {
         .build()
         .unwrap();
 
-    let v1 = ac.mget(&[("test-key1".to_string(), ())]).await.unwrap();
-    dbg!(&v1);
+    let key = "autocache:test:redis-cache".to_string();
+    ac.mdel(std::slice::from_ref(&key)).await.unwrap();
+
+    let values = ac.mget(&[(key.clone(), ())]).await.unwrap();
+
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0].0, key);
+    assert_eq!(values[0].1.message, "autocache:test:redis-cache");
+
+    ac.mdel(std::slice::from_ref(&key)).await.unwrap();
 }

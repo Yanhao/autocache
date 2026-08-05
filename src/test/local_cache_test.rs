@@ -8,15 +8,157 @@ use futures::FutureExt;
 use crate::{
     autocache::AutoCache,
     local_cache::{LocalCache, LocalCacheOption},
-    Entry, Options,
+    Cache, Entry, EntryTrait, Options,
 };
 
 fn on_metrics(_method: &str, _is_error: bool, _ns: &str, _from: &str, _cache_name: &str) {}
+
+static SOURCE_FIRST_METRIC_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SOURCE_FIRST_METRIC_ERRORS: AtomicUsize = AtomicUsize::new(0);
+static SOURCE_FIRST_METRIC_SOURCE: AtomicUsize = AtomicUsize::new(0);
+static CACHE_FIRST_METRIC_ERRORS: AtomicUsize = AtomicUsize::new(0);
+static CACHE_FIRST_METRIC_SOURCE: AtomicUsize = AtomicUsize::new(0);
+static ASYNC_CACHE_WRITE_METRIC_ERRORS: AtomicUsize = AtomicUsize::new(0);
+static ASYNC_REFRESH_QUEUE_METRIC_ERRORS: AtomicUsize = AtomicUsize::new(0);
+static ASYNC_SOURCE_REFRESH_METRIC_ERRORS: AtomicUsize = AtomicUsize::new(0);
+static CACHE_INVALIDATION_METRIC_ERRORS: AtomicUsize = AtomicUsize::new(0);
+
+fn source_first_metrics(_method: &str, is_error: bool, _ns: &str, from: &str, _cache_name: &str) {
+    SOURCE_FIRST_METRIC_CALLS.fetch_add(1, Ordering::SeqCst);
+    if is_error {
+        SOURCE_FIRST_METRIC_ERRORS.fetch_add(1, Ordering::SeqCst);
+    }
+    if from == "source" {
+        SOURCE_FIRST_METRIC_SOURCE.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn cache_first_metrics(method: &str, is_error: bool, _ns: &str, from: &str, _cache_name: &str) {
+    if method == "mget" && is_error {
+        CACHE_FIRST_METRIC_ERRORS.fetch_add(1, Ordering::SeqCst);
+    }
+    if method == "mget" && !is_error && from == "source" {
+        CACHE_FIRST_METRIC_SOURCE.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn async_cache_write_metrics(
+    method: &str,
+    is_error: bool,
+    _ns: &str,
+    _from: &str,
+    _cache_name: &str,
+) {
+    if method == "mset" && is_error {
+        ASYNC_CACHE_WRITE_METRIC_ERRORS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn async_refresh_queue_metrics(
+    method: &str,
+    is_error: bool,
+    _ns: &str,
+    _from: &str,
+    _cache_name: &str,
+) {
+    if method == "refresh" && is_error {
+        ASYNC_REFRESH_QUEUE_METRIC_ERRORS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn async_source_refresh_metrics(
+    method: &str,
+    is_error: bool,
+    _ns: &str,
+    _from: &str,
+    _cache_name: &str,
+) {
+    if method == "refresh" && is_error {
+        ASYNC_SOURCE_REFRESH_METRIC_ERRORS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn cache_invalidation_metrics(
+    method: &str,
+    is_error: bool,
+    _ns: &str,
+    _from: &str,
+    _cache_name: &str,
+) {
+    if method == "mdel" && is_error {
+        CACHE_INVALIDATION_METRIC_ERRORS.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Item {
     count: u32,
     message: String,
+}
+
+#[derive(Clone)]
+struct BlockingWriteCache {
+    started: Arc<AtomicUsize>,
+    completed: Arc<AtomicUsize>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl BlockingWriteCache {
+    fn new() -> Self {
+        Self {
+            started: Arc::new(AtomicUsize::new(0)),
+            completed: Arc::new(AtomicUsize::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+impl Cache for BlockingWriteCache {
+    type Key = String;
+    type Value = Entry<String, String>;
+
+    async fn mget(&self, _keys: &[Self::Key]) -> anyhow::Result<Vec<Self::Value>> {
+        Ok(Vec::new())
+    }
+
+    async fn mset(&self, _kvs: &[(Self::Key, Self::Value)]) -> anyhow::Result<()> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        self.release.acquire().await?.forget();
+        self.completed.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn mdel(&self, _keys: &[Self::Key]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "blocking-write-cache"
+    }
+}
+
+#[derive(Clone)]
+struct FailingDeleteCache;
+
+impl Cache for FailingDeleteCache {
+    type Key = String;
+    type Value = Entry<String, String>;
+
+    async fn mget(&self, _keys: &[Self::Key]) -> anyhow::Result<Vec<Self::Value>> {
+        Ok(Vec::new())
+    }
+
+    async fn mset(&self, _kvs: &[(Self::Key, Self::Value)]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn mdel(&self, _keys: &[Self::Key]) -> anyhow::Result<()> {
+        anyhow::bail!("cache invalidation failed")
+    }
+
+    fn name(&self) -> &'static str {
+        "failing-delete-cache"
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -33,7 +175,7 @@ impl AsRef<str> for TenantKey {
 
 #[tokio::test]
 async fn test_builder() {
-    tracing_subscriber::fmt::init();
+    let _ = tracing_subscriber::fmt::try_init();
 
     let ac = AutoCache::builder()
         .cache(LocalCache::new(LocalCacheOption {
@@ -64,6 +206,9 @@ async fn test_builder() {
 
     let v1 = ac.mget(&[("test-key1".to_string(), ())]).await.unwrap();
     dbg!(&v1);
+    assert_eq!(v1.len(), 1);
+    assert_eq!(v1[0].1.count, 1);
+    assert_eq!(v1[0].1.message, "test-key1");
     // assert_eq!(v1.len(), 1);
     // assert_eq!(
     //     v1.get(0),
@@ -151,6 +296,383 @@ async fn test_request_scoped_expired_data_falls_back_to_sync_source_without_work
     assert_eq!(source_calls.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test]
+async fn test_source_first_none_does_not_fall_back_to_expired_cache_entry() {
+    let ac = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .expire_time(std::time::Duration::ZERO)
+        .source_first(true)
+        .single_loader(|_key: String, ()| async move { Ok(None) }.boxed())
+        .build()
+        .unwrap();
+
+    let key = "test-key".to_string();
+    ac.mset(&[(key.clone(), "stale-value".to_string())])
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+    let result = ac.mget(&[(key, ())]).await.unwrap();
+
+    assert!(result.is_empty());
+}
+
+#[tokio::test]
+async fn test_single_loader_not_found_invalidates_existing_positive_cache() {
+    let source_calls = Arc::new(AtomicUsize::new(0));
+    let loader_calls = source_calls.clone();
+    let ac = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .single_loader(move |_key: String, ()| {
+            let loader_calls = loader_calls.clone();
+            async move {
+                loader_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(None::<String>)
+            }
+            .boxed()
+        })
+        .build()
+        .unwrap();
+
+    let key = "test-key".to_string();
+    ac.mset(&[(key.clone(), "stale-value".to_string())])
+        .await
+        .unwrap();
+
+    let source_first = ac
+        .mget_with_option(
+            &[(key.clone(), ())],
+            Options {
+                source_first: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let cache_first = ac.mget(&[(key, ())]).await.unwrap();
+
+    assert!(source_first.is_empty());
+    assert!(cache_first.is_empty());
+    assert_eq!(source_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn test_multi_loader_not_found_invalidates_existing_positive_cache() {
+    let source_calls = Arc::new(AtomicUsize::new(0));
+    let loader_calls = source_calls.clone();
+    let ac = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .multi_loader(move |_keys: Vec<(String, ())>| {
+            let loader_calls = loader_calls.clone();
+            async move {
+                loader_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::<(String, String)>::new())
+            }
+            .boxed()
+        })
+        .build()
+        .unwrap();
+
+    let key = "test-key".to_string();
+    ac.mset(&[(key.clone(), "stale-value".to_string())])
+        .await
+        .unwrap();
+
+    let source_first = ac
+        .mget_with_option(
+            &[(key.clone(), ())],
+            Options {
+                source_first: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let cache_first = ac.mget(&[(key, ())]).await.unwrap();
+
+    assert!(source_first.is_empty());
+    assert!(cache_first.is_empty());
+    assert_eq!(source_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn test_source_first_honors_request_scoped_negative_caching() {
+    let source_calls = Arc::new(AtomicUsize::new(0));
+    let loader_calls = source_calls.clone();
+    let ac = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .single_loader(move |_key: String, ()| {
+            let loader_calls = loader_calls.clone();
+            async move {
+                loader_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(None::<String>)
+            }
+            .boxed()
+        })
+        .build()
+        .unwrap();
+
+    let key = "test-key".to_string();
+    let first = ac
+        .mget_with_option(
+            &[(key.clone(), ())],
+            Options {
+                source_first: Some(true),
+                cache_none: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let second = ac.mget(&[(key, ())]).await.unwrap();
+
+    assert!(first.is_empty());
+    assert!(second.is_empty());
+    assert_eq!(source_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_source_first_records_success_and_error_metrics() {
+    SOURCE_FIRST_METRIC_CALLS.store(0, Ordering::SeqCst);
+    SOURCE_FIRST_METRIC_ERRORS.store(0, Ordering::SeqCst);
+    SOURCE_FIRST_METRIC_SOURCE.store(0, Ordering::SeqCst);
+
+    let success = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .source_first(true)
+        .on_metrics(source_first_metrics)
+        .single_loader(|key: String, ()| async move { Ok(Some(key)) }.boxed())
+        .build()
+        .unwrap();
+    success
+        .mget(&[("success-key".to_string(), ())])
+        .await
+        .unwrap();
+
+    let failure = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .source_first(true)
+        .on_metrics(source_first_metrics)
+        .single_loader(|_key: String, ()| {
+            async move { Err::<Option<String>, _>(anyhow::anyhow!("loader failed")) }.boxed()
+        })
+        .build()
+        .unwrap();
+    failure
+        .mget(&[("failure-key".to_string(), ())])
+        .await
+        .unwrap_err();
+
+    assert_eq!(SOURCE_FIRST_METRIC_CALLS.load(Ordering::SeqCst), 2);
+    assert_eq!(SOURCE_FIRST_METRIC_ERRORS.load(Ordering::SeqCst), 1);
+    assert_eq!(SOURCE_FIRST_METRIC_SOURCE.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn test_cache_first_records_multi_loader_errors_and_not_found_source() {
+    CACHE_FIRST_METRIC_ERRORS.store(0, Ordering::SeqCst);
+    CACHE_FIRST_METRIC_SOURCE.store(0, Ordering::SeqCst);
+
+    let not_found = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .on_metrics(cache_first_metrics)
+        .multi_loader(|_keys: Vec<(String, ())>| {
+            async move { Ok(Vec::<(String, String)>::new()) }.boxed()
+        })
+        .build()
+        .unwrap();
+    assert!(not_found
+        .mget(&[("not-found-key".to_string(), ())])
+        .await
+        .unwrap()
+        .is_empty());
+
+    let failure = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .on_metrics(cache_first_metrics)
+        .multi_loader(|_keys: Vec<(String, ())>| {
+            async move { Err::<Vec<(String, String)>, _>(anyhow::anyhow!("multi loader failed")) }
+                .boxed()
+        })
+        .build()
+        .unwrap();
+    failure
+        .mget(&[("failure-key".to_string(), ())])
+        .await
+        .unwrap_err();
+
+    assert_eq!(CACHE_FIRST_METRIC_SOURCE.load(Ordering::SeqCst), 1);
+    assert_eq!(CACHE_FIRST_METRIC_ERRORS.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_failed_automatic_invalidation_records_metric() {
+    CACHE_INVALIDATION_METRIC_ERRORS.store(0, Ordering::SeqCst);
+    let ac = AutoCache::builder()
+        .cache(FailingDeleteCache)
+        .source_first(true)
+        .on_metrics(cache_invalidation_metrics)
+        .single_loader(|_key: String, ()| async move { Ok(None::<String>) }.boxed())
+        .build()
+        .unwrap();
+
+    let result = ac.mget(&[("test-key".to_string(), ())]).await.unwrap();
+
+    assert!(result.is_empty());
+    assert_eq!(CACHE_INVALIDATION_METRIC_ERRORS.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn test_async_cache_fill_falls_back_without_tokio_runtime() {
+    let source_calls = Arc::new(AtomicUsize::new(0));
+    let loader_calls = source_calls.clone();
+    let ac = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .async_set_cache(true)
+        .single_loader(move |key: String, ()| {
+            let loader_calls = loader_calls.clone();
+            async move {
+                loader_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(format!("source:{key}")))
+            }
+            .boxed()
+        })
+        .build()
+        .unwrap();
+
+    let key = "test-key".to_string();
+    let first = futures::executor::block_on(ac.mget(&[(key.clone(), ())])).unwrap();
+    let second = futures::executor::block_on(ac.mget(&[(key.clone(), ())])).unwrap();
+
+    assert_eq!(first, vec![(key.clone(), "source:test-key".to_string())]);
+    assert_eq!(second, vec![(key, "source:test-key".to_string())]);
+    assert_eq!(source_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_async_cache_fill_is_skipped_when_concurrency_limit_is_reached() {
+    const WRITE_LIMIT: usize = 2;
+
+    ASYNC_CACHE_WRITE_METRIC_ERRORS.store(0, Ordering::SeqCst);
+    let cache = BlockingWriteCache::new();
+    let observer = cache.clone();
+    let ac = AutoCache::builder()
+        .cache(cache)
+        .source_first(true)
+        .async_set_cache(true)
+        .max_concurrent_async_cache_writes(WRITE_LIMIT)
+        .on_metrics(async_cache_write_metrics)
+        .single_loader(|key: String, ()| async move { Ok(Some(key)) }.boxed())
+        .build()
+        .unwrap();
+
+    for index in 0..=WRITE_LIMIT {
+        let key = format!("test-key-{index}");
+        assert_eq!(
+            ac.mget(&[(key.clone(), ())]).await.unwrap(),
+            vec![(key.clone(), key)]
+        );
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while observer.started.load(Ordering::SeqCst) < WRITE_LIMIT {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(observer.started.load(Ordering::SeqCst), WRITE_LIMIT);
+
+    observer.release.add_permits(WRITE_LIMIT);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while observer.completed.load(Ordering::SeqCst) < WRITE_LIMIT {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(observer.completed.load(Ordering::SeqCst), WRITE_LIMIT);
+    assert_eq!(ASYNC_CACHE_WRITE_METRIC_ERRORS.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_local_cache_zero_segments_uses_one_segment() {
+    let cache = LocalCache::new(LocalCacheOption {
+        segments: 0,
+        ..Default::default()
+    });
+    let key = "test-key".to_string();
+
+    cache
+        .mset(&[(key.clone(), "test-value".to_string())])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        cache.mget(&[key]).await.unwrap(),
+        vec!["test-value".to_string()]
+    );
+}
+
+#[test]
+fn test_entry_expiration_handles_extreme_timestamps() {
+    let future = Entry::<String, String> {
+        key: "future".to_string(),
+        value: None,
+        expire_at_ms: Some(i64::MAX),
+    };
+    let past = Entry::<String, String> {
+        key: "past".to_string(),
+        value: None,
+        expire_at_ms: Some(i64::MIN),
+    };
+
+    assert!(!future.is_expired());
+    assert!(past.is_expired());
+}
+
+#[tokio::test]
+async fn test_out_of_range_expiration_duration_returns_error() {
+    let positive = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .expire_time(std::time::Duration::MAX)
+        .single_loader(|key: String, ()| async move { Ok(Some(key)) }.boxed())
+        .build()
+        .unwrap();
+    assert_eq!(
+        positive
+            .mget(&[("test-key".to_string(), ())])
+            .await
+            .unwrap_err()
+            .to_string(),
+        "expiration duration is out of range"
+    );
+    assert_eq!(
+        positive
+            .mset(&[("test-key".to_string(), "test-value".to_string())])
+            .await
+            .unwrap_err()
+            .to_string(),
+        "expiration duration is out of range"
+    );
+
+    let negative = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .cache_none(true)
+        .none_value_expire_time(std::time::Duration::MAX)
+        .single_loader(|_key: String, ()| async move { Ok(None::<String>) }.boxed())
+        .build()
+        .unwrap();
+    assert_eq!(
+        negative
+            .mget(&[("test-key".to_string(), ())])
+            .await
+            .unwrap_err()
+            .to_string(),
+        "expiration duration is out of range"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_stale_reads_enqueue_only_one_refresh_per_key() {
     let source_calls = Arc::new(AtomicUsize::new(0));
@@ -209,6 +731,111 @@ async fn test_concurrent_stale_reads_enqueue_only_one_refresh_per_key() {
     release_refresh.notify_one();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(source_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn test_stale_read_does_not_wait_for_refresh_queue_capacity() {
+    const REFRESH_QUEUE_CAPACITY: usize = 2;
+
+    ASYNC_REFRESH_QUEUE_METRIC_ERRORS.store(0, Ordering::SeqCst);
+    let refresh_started = Arc::new(tokio::sync::Notify::new());
+    let loader_refresh_started = refresh_started.clone();
+    let release_refresh = Arc::new(tokio::sync::Notify::new());
+    let loader_release_refresh = release_refresh.clone();
+    let ac = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .expire_time(std::time::Duration::ZERO)
+        .use_expired_data(true)
+        .async_refresh_queue_capacity(REFRESH_QUEUE_CAPACITY)
+        .on_metrics(async_refresh_queue_metrics)
+        .single_loader(move |key: String, ()| {
+            let loader_refresh_started = loader_refresh_started.clone();
+            let loader_release_refresh = loader_release_refresh.clone();
+            async move {
+                if key == "blocking-key" {
+                    loader_refresh_started.notify_one();
+                    loader_release_refresh.notified().await;
+                }
+                Ok(Some(format!("source:{key}")))
+            }
+            .boxed()
+        })
+        .build()
+        .unwrap();
+
+    let stale_key = "stale-key".to_string();
+    ac.mset(&[(stale_key.clone(), "stale-value".to_string())])
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+    ac.refresh(&[("blocking-key".to_string(), ())])
+        .await
+        .unwrap();
+    refresh_started.notified().await;
+    for index in 0..REFRESH_QUEUE_CAPACITY {
+        ac.refresh(&[(format!("queued-key-{index}"), ())])
+            .await
+            .unwrap();
+    }
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        ac.mget(&[(stale_key.clone(), ())]),
+    )
+    .await
+    .expect("stale read should not wait for refresh queue capacity")
+    .unwrap();
+
+    assert_eq!(result, vec![(stale_key, "stale-value".to_string())]);
+    assert_eq!(ASYNC_REFRESH_QUEUE_METRIC_ERRORS.load(Ordering::SeqCst), 1);
+    release_refresh.notify_one();
+}
+
+#[tokio::test]
+async fn test_async_source_refresh_failure_records_metric() {
+    ASYNC_SOURCE_REFRESH_METRIC_ERRORS.store(0, Ordering::SeqCst);
+    let source_calls = Arc::new(AtomicUsize::new(0));
+    let loader_calls = source_calls.clone();
+    let ac = AutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .expire_time(std::time::Duration::ZERO)
+        .use_expired_data(true)
+        .on_metrics(async_source_refresh_metrics)
+        .single_loader(move |key: String, ()| {
+            let loader_calls = loader_calls.clone();
+            async move {
+                if loader_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(Some("stale-value".to_string()))
+                } else {
+                    anyhow::bail!("source refresh failed for {key}")
+                }
+            }
+            .boxed()
+        })
+        .build()
+        .unwrap();
+
+    let key = "test-key".to_string();
+    assert_eq!(
+        ac.mget(&[(key.clone(), ())]).await.unwrap(),
+        vec![(key.clone(), "stale-value".to_string())]
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    assert_eq!(
+        ac.mget(&[(key.clone(), ())]).await.unwrap(),
+        vec![(key, "stale-value".to_string())]
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while ASYNC_SOURCE_REFRESH_METRIC_ERRORS.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(source_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(ASYNC_SOURCE_REFRESH_METRIC_ERRORS.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -384,6 +1011,26 @@ fn test_builder_returns_errors_instead_of_panicking_for_invalid_configuration() 
     assert_eq!(
         invalid_batch_size.err().unwrap().to_string(),
         "max_batch_size must be greater than zero"
+    );
+
+    let invalid_async_write_limit = StringAutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .single_loader(|key: String, ()| async move { Ok(Some(key)) }.boxed())
+        .max_concurrent_async_cache_writes(0)
+        .build();
+    assert_eq!(
+        invalid_async_write_limit.err().unwrap().to_string(),
+        "max_concurrent_async_cache_writes must be greater than zero"
+    );
+
+    let invalid_refresh_queue_capacity = StringAutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .single_loader(|key: String, ()| async move { Ok(Some(key)) }.boxed())
+        .async_refresh_queue_capacity(0)
+        .build();
+    assert_eq!(
+        invalid_refresh_queue_capacity.err().unwrap().to_string(),
+        "async_refresh_queue_capacity must be greater than zero"
     );
 
     let missing_runtime = StringAutoCache::builder()

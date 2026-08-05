@@ -3,7 +3,7 @@ use std::{fmt::Debug, hash::Hash};
 use anyhow::Result;
 use derivative::Derivative;
 use moka::sync::SegmentedCache;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::cache::Cache;
 
@@ -28,7 +28,13 @@ where
     V: Sync + Send + Clone + 'static,
 {
     pub fn new(opts: LocalCacheOption) -> Self {
-        let data = SegmentedCache::builder(opts.segments)
+        let segments = if opts.segments == 0 {
+            warn!("autocache: LocalCache segments must be greater than zero; using one segment");
+            1
+        } else {
+            opts.segments
+        };
+        let data = SegmentedCache::builder(segments)
             .time_to_live(opts.ttl)
             .max_capacity(opts.max_capacity)
             .build();
@@ -60,7 +66,7 @@ where
             kvs.iter().map(|(k, _)| k).collect::<Vec<_>>()
         );
 
-        for kv in kvs.into_iter() {
+        for kv in kvs {
             self.data.insert(kv.0.clone(), kv.1.clone());
         }
 
