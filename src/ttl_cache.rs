@@ -5,7 +5,7 @@ use arc_swap::ArcSwapOption;
 use chrono::prelude::*;
 use futures::future::BoxFuture;
 
-use crate::{cache::Cache, entry::EntryTrait};
+use crate::{cache::Cache, entry::EntryTrait, error::AutoCacheError};
 
 #[derive(Clone)]
 struct CacheItem<V> {
@@ -15,13 +15,8 @@ struct CacheItem<V> {
 
 impl<V> CacheItem<V> {
     fn need_to_remove(&self) -> bool {
-        if self.time_to_remove_ms.is_none() {
-            return false;
-        }
-
-        Utc.timestamp_millis_opt(self.time_to_remove_ms.unwrap())
-            .unwrap()
-            < chrono::Utc::now()
+        self.time_to_remove_ms
+            .is_some_and(|expires_at| expires_at <= Utc::now().timestamp_millis())
     }
 }
 
@@ -83,21 +78,46 @@ where
     type Value = V;
 
     async fn mget(&self, keys: &[Self::Key]) -> Result<Vec<Self::Value>> {
+        if self.ttl.is_none() {
+            let data = self.data.read();
+            return Ok(keys
+                .iter()
+                .filter_map(|key| data.get(key).cloned().map(|item| item.value))
+                .collect());
+        }
+
+        let mut data = self.data.write();
         Ok(keys
             .iter()
-            .filter_map(|key| self.data.read().get(key).cloned().map(|c| c.value))
-            .collect::<Vec<_>>())
+            .filter_map(|key| match data.get(key).cloned() {
+                Some(item) if item.need_to_remove() => {
+                    data.remove(key);
+                    None
+                }
+                Some(item) => Some(item.value),
+                None => None,
+            })
+            .collect())
     }
 
     async fn mset(&self, kvs: &[(Self::Key, Self::Value)]) -> Result<()> {
+        let time_to_remove_ms = self
+            .ttl
+            .map(|ttl| {
+                let ttl_ms = i64::try_from(ttl.as_millis())?;
+                Utc::now()
+                    .timestamp_millis()
+                    .checked_add(ttl_ms)
+                    .ok_or_else(|| anyhow::anyhow!("TTL expiration timestamp overflow"))
+            })
+            .transpose()?;
+
+        let mut data = self.data.write();
         for kv in kvs.into_iter() {
-            self.data.write().insert(
+            data.insert(
                 kv.0.clone(),
                 CacheItem {
-                    time_to_remove_ms: self.ttl.map(|ttl| {
-                        (chrono::Utc::now() + chrono::Duration::from_std(ttl).unwrap())
-                            .timestamp_millis()
-                    }),
+                    time_to_remove_ms,
                     value: kv.1.clone(),
                 },
             );
@@ -107,8 +127,9 @@ where
     }
 
     async fn mdel(&self, keys: &[Self::Key]) -> Result<()> {
+        let mut data = self.data.write();
         keys.iter().for_each(|key| {
-            self.data.write().remove(key);
+            data.remove(key);
         });
 
         Ok(())
@@ -149,9 +170,8 @@ where
     }
 
     fn cleanup_ttl(cache: Arc<parking_lot::RwLock<im::OrdMap<K, CacheItem<V>>>>) {
-        let cache_snap = cache.read().clone();
-
-        let keys_to_remove = cache_snap
+        let mut cache = cache.write();
+        let keys_to_remove = cache
             .iter()
             .filter_map(|(key, ci)| {
                 if ci.need_to_remove() {
@@ -160,11 +180,10 @@ where
                     None
                 }
             })
-            .take(100)
             .collect::<Vec<_>>();
 
         for key in keys_to_remove.iter() {
-            cache.write().remove(key);
+            cache.remove(key);
         }
     }
 
@@ -173,9 +192,9 @@ where
             return Ok(());
         }
 
-        let Some(listener) = self.expire_listener.load().clone() else {
-            bail!("expire listener is none");
-        };
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| AutoCacheError::RuntimeUnavailable)?;
+        let listener = self.expire_listener.load_full();
 
         let notifier = Arc::new(tokio::sync::Notify::new());
         self.stop_notifier.store(Some(notifier.clone()));
@@ -184,12 +203,14 @@ where
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let cache = self.data.clone();
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             loop {
                 tokio::select! {
                     _ = ticker.tick()=> {
                         Self::cleanup_ttl(cache.clone());
-                        Self::check_expires(cache.clone(), listener.clone()).await;
+                        if let Some(listener) = listener.as_ref() {
+                            Self::check_expires(cache.clone(), listener.clone()).await;
+                        }
                     }
 
                     _ = notifier.notified() => {

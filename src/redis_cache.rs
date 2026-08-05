@@ -65,15 +65,19 @@ where
     type Value = V;
 
     async fn mget(&self, keys: &[Self::Key]) -> Result<Vec<Self::Value>> {
-        let mut conn = self.redis_cli.get_async_connection().await?;
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
 
-        if keys.len() == 1 {
-            let key = keys.get(0).unwrap();
-            let data: bytes::Bytes = conn.get(&self.generate_redis_key(key.clone())).await?;
+        let mut conn = self.redis_cli.get_multiplexed_async_connection().await?;
 
-            let value: V = V::decode(data)?;
+        if let [key] = keys {
+            let data: Option<Bytes> = conn.get(&self.generate_redis_key(key.clone())).await?;
 
-            return Ok(vec![value]);
+            return match data {
+                Some(data) => Ok(vec![V::decode(data)?]),
+                None => Ok(vec![]),
+            };
         }
 
         let res: Vec<Option<Bytes>> = conn
@@ -84,71 +88,59 @@ where
             )
             .await?;
 
-        Ok(res
-            .into_iter()
-            .filter_map(|data| data.map(|data| V::decode(data).unwrap()))
-            .collect::<Vec<_>>())
+        res.into_iter().flatten().map(V::decode).collect()
     }
 
     async fn mset(&self, kvs: &[(Self::Key, Self::Value)]) -> Result<()> {
-        let mut conn = self.redis_cli.get_async_connection().await?;
+        if kvs.is_empty() {
+            return Ok(());
+        }
 
-        if kvs.len() == 1 {
-            let kv = kvs.get(0).unwrap();
+        let encoded_kvs = kvs
+            .iter()
+            .map(|(key, value)| {
+                Ok((
+                    self.generate_redis_key(key.clone()),
+                    value.encode()?.to_vec(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut conn = self.redis_cli.get_multiplexed_async_connection().await?;
+
+        if let [(key, value)] = encoded_kvs.as_slice() {
             if self.ttl_sec == 0 {
-                conn.set(
-                    &self.generate_redis_key(kv.0.clone()),
-                    kv.1.encode().unwrap().to_vec(),
-                )
-                .await?;
+                conn.set::<_, _, ()>(key, value).await?;
             } else {
-                conn.set_ex(
-                    &self.generate_redis_key(kv.0.clone()),
-                    kv.1.encode().unwrap().to_vec(),
-                    self.ttl_sec,
-                )
-                .await?;
+                conn.set_ex::<_, _, ()>(key, value, self.ttl_sec.try_into()?)
+                    .await?;
             }
             return Ok(());
         }
 
         if self.ttl_sec == 0 {
-            conn.mset(
-                &kvs.iter()
-                    .map(|(key, value)| {
-                        (
-                            self.generate_redis_key(key.clone()),
-                            value.encode().unwrap().to_vec(),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .await?;
+            conn.mset::<_, _, ()>(&encoded_kvs).await?;
         } else {
             let mut pipe = redis::Pipeline::new();
-            pipe.mset(
-                &kvs.iter()
-                    .map(|(key, value)| {
-                        (
-                            self.generate_redis_key(key.clone()),
-                            value.encode().unwrap().to_vec(),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            for (key, _) in kvs {
-                pipe.expire(&self.generate_redis_key(key.clone()), self.ttl_sec);
+            pipe.mset(&encoded_kvs);
+            let ttl_sec = self.ttl_sec.try_into()?;
+            for (key, _) in &encoded_kvs {
+                pipe.expire(key, ttl_sec);
             }
 
-            pipe.query_async(&mut conn).await?;
+            pipe.query_async::<()>(&mut conn).await?;
         }
 
         Ok(())
     }
 
     async fn mdel(&self, keys: &[Self::Key]) -> Result<()> {
-        let mut conn = self.redis_cli.get_async_connection().await?;
-        conn.del(
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.redis_cli.get_multiplexed_async_connection().await?;
+        conn.del::<_, ()>(
             keys.iter()
                 .map(|key| self.generate_redis_key(key.clone()))
                 .collect::<Vec<_>>(),

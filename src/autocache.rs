@@ -1,4 +1,4 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{collections::HashSet, fmt::Debug, hash::Hash, sync::Arc};
 
 use anyhow::{bail, Result};
 use arc_swap::ArcSwapOption;
@@ -12,20 +12,21 @@ use crate::{
     entry::{Entry, EntryTrait},
     error::AutoCacheError,
     loader::Loader,
+    singleflight::Group,
     Options,
 };
 
 pub struct AutoCache<K, V, C, E>
 where
-    K: Clone,
+    K: Clone + Eq + Hash,
     V: Clone,
     C: Cache<Key = K, Value = Entry<K, V>>,
 {
     pub(crate) cache_store: Arc<C>,
     pub(crate) loader: Arc<Loader<K, V, E>>,
 
-    pub(crate) sfg: Arc<async_singleflight::Group<Option<V>, anyhow::Error>>,
-    pub(crate) mfg: Arc<async_singleflight::Group<Vec<(K, V)>, anyhow::Error>>,
+    pub(crate) sfg: Arc<Group<K, Option<Entry<K, V>>>>,
+    pub(crate) mfg: Arc<Group<BatchKey<K>, Vec<Entry<K, V>>>>,
 
     pub(crate) namespace: Option<String>,
     pub(crate) expire_time: std::time::Duration,
@@ -39,6 +40,7 @@ where
 
     pub(crate) async_refresh_channel:
         ArcSwapOption<tokio::sync::mpsc::Sender<AsyncSourceTask<K, E>>>,
+    pub(crate) pending_refresh_keys: Arc<parking_lot::Mutex<HashSet<K>>>,
     pub(crate) stop_ch: Option<tokio::sync::mpsc::Sender<()>>,
 
     pub(crate) on_metrics:
@@ -47,7 +49,7 @@ where
 
 impl<K, V, C, E> AutoCache<K, V, C, E>
 where
-    K: Clone + Debug + PartialEq + AsRef<str> + Sync + Send + 'static,
+    K: Clone + Debug + Eq + Hash + Sync + Send + 'static,
     V: Clone + Debug + Sync + Send + 'static,
     C: Cache<Key = K, Value = Entry<K, V>> + Sync + Send + 'static,
     E: Clone + Debug + Sync + Send + 'static,
@@ -57,6 +59,9 @@ where
     }
 
     pub(crate) fn start(&mut self) -> Result<()> {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| AutoCacheError::RuntimeUnavailable)?;
+
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         self.stop_ch.replace(tx);
 
@@ -70,8 +75,9 @@ where
         let none_value_expire_time = self.none_value_expire_time;
         let sfg = self.sfg.clone();
         let mfg = self.mfg.clone();
+        let pending_refresh_keys = self.pending_refresh_keys.clone();
 
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             loop {
                 tokio::select! {
                     _ = rx.recv() => {
@@ -81,8 +87,9 @@ where
                         let Some(t) = t else {
                             continue;
                         };
+                        let task_keys = t.keys.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
 
-                        let _ = match *loader {
+                        let result = match *loader {
                             Loader::SingleLoader(_) => {
                                 Self::source_by_sloader(
                                     &t.keys,
@@ -110,6 +117,8 @@ where
                                 .await.inspect_err(|e| error!("async source by mloader failed, error {e}"))
                             }
                         };
+                        Self::remove_pending_refresh_keys(&pending_refresh_keys, &task_keys);
+                        let _ = result;
                     }
                 }
             }
@@ -118,10 +127,20 @@ where
         Ok(())
     }
 
+    fn remove_pending_refresh_keys(
+        pending_refresh_keys: &parking_lot::Mutex<HashSet<K>>,
+        keys: &[K],
+    ) {
+        let mut pending_refresh_keys = pending_refresh_keys.lock();
+        for key in keys {
+            pending_refresh_keys.remove(key);
+        }
+    }
+
     async fn source_by_sloader(
         keys: &[(K, E)],
         loader: Arc<Loader<K, V, E>>,
-        sfg: Arc<async_singleflight::Group<Option<V>, anyhow::Error>>,
+        sfg: Arc<Group<K, Option<Entry<K, V>>>>,
         cache: Arc<C>,
         cache_none: bool,
         expire_time: std::time::Duration,
@@ -135,62 +154,59 @@ where
         let mut ret = Vec::with_capacity(keys.len());
 
         for (key, extra) in keys.iter() {
-            let (value, err, _owner) = sfg
-                .work(
-                    key.as_ref(),
-                    (|| async { (sloader)(key.clone(), extra.clone()).await })(),
-                )
-                .await;
+            let loader_key = key.clone();
+            let loader_extra = extra.clone();
+            let loader_cache = cache.clone();
+            let entry = sfg
+                .work(key.clone(), async move {
+                    let value = (sloader)(loader_key.clone(), loader_extra).await?;
 
-            if err.is_some() {
-                error!(msg = "autocache: single source failed", error = ?err, key = ?key);
-                anyhow::bail!(AutoCacheError::SingleFlight);
-            }
-            if value.is_none() {
-                error!(msg = "autocache: single source failed (not sf leader)", key = ?key);
-                anyhow::bail!(AutoCacheError::SingleFlight);
-            }
-            let value = value.unwrap();
+                    if value.is_none() {
+                        debug!(msg = "autocache: source value is none", key = ?loader_key);
 
-            if value.is_none() {
-                debug!(msg = "autocache: source value is none", key = ?key);
+                        if !cache_none {
+                            return Ok(None);
+                        }
+                    }
+                    debug!(msg = "autocache: source value from single loader", key = ?loader_key);
 
-                if !cache_none {
-                    continue;
-                }
-            }
-            debug!(msg = "autocache: source value from single loader", key = ?key);
+                    let entry_expire_time = if value.is_none() {
+                        none_value_expire_time
+                    } else {
+                        expire_time
+                    };
+                    let entry = Entry {
+                        key: loader_key.clone(),
+                        value,
+                        expire_at_ms: Some(
+                            (Utc::now() + chrono::Duration::from_std(entry_expire_time).unwrap())
+                                .timestamp_millis(),
+                        ),
+                    };
 
-            let expire_time = if value.is_none() {
-                none_value_expire_time
-            } else {
-                expire_time
-            };
-            let entry = Entry {
-                key: key.clone(),
-                value,
-                expire_at_ms: Some(
-                    (Utc::now() + chrono::Duration::from_std(expire_time).unwrap())
-                        .timestamp_millis(),
-                ),
-            };
+                    if async_set_cache {
+                        let key = loader_key.clone();
+                        let cache_entry = entry.clone();
+                        tokio::spawn(async move {
+                            debug!(msg = "autocache: async set cache", key = ?key);
+                            let _ = loader_cache
+                                .mset(&[(key.clone(), cache_entry)])
+                                .await
+                                .inspect_err(|e| error!("mset cache failed, error: {e}"));
+                        });
+                    } else {
+                        debug!(msg = "autocache: sync set cache", key = ?loader_key);
+                        loader_cache
+                            .mset(&[(loader_key.clone(), entry.clone())])
+                            .await?;
+                    }
 
-            ret.push(entry.clone());
+                    Ok(Some(entry))
+                })
+                .await?;
 
-            if async_set_cache {
-                let key = key.clone();
-                let entry = entry.clone();
-                let cache = cache.clone();
-                tokio::spawn(async move {
-                    debug!(msg = "autocache: async set cache", key = ?key);
-                    let _ = cache
-                        .mset(&[(key.clone(), entry)])
-                        .await
-                        .inspect_err(|e| error!("mset cache failed, error: {e}"));
-                });
-            } else {
-                debug!(msg = "autocache: sync set cache", key = ?key);
-                cache.mset(&[(key.clone(), entry)]).await?;
+            if let Some(entry) = entry {
+                ret.push(entry);
             }
         }
 
@@ -200,7 +216,7 @@ where
     async fn source_by_mloader(
         keys: Vec<(K, E)>,
         loader: Arc<Loader<K, V, E>>,
-        mfg: Arc<async_singleflight::Group<Vec<(K, V)>, anyhow::Error>>,
+        mfg: Arc<Group<BatchKey<K>, Vec<Entry<K, V>>>>,
         cache: Arc<C>,
         cache_none: bool,
         expire_time: std::time::Duration,
@@ -211,75 +227,65 @@ where
             unreachable!();
         };
 
-        let sfg_key = {
-            let mut a = keys.iter().map(|k| k.0.as_ref()).collect::<Vec<_>>();
-            a.sort();
-            a.join(",")
-        };
+        let batch_key = BatchKey(keys.iter().map(|(key, _)| key.clone()).collect());
+        let loader_keys = keys.clone();
 
-        let (kvs, err, _owner) = mfg
-            .work(&sfg_key, (|| async { (mloader)(keys.clone()).await })())
-            .await;
-
-        if err.is_some() {
-            anyhow::bail!(AutoCacheError::SingleFlight);
-        }
-        if kvs.is_none() {
-            anyhow::bail!(AutoCacheError::SingleFlight);
-        }
-
-        let kvs = kvs.unwrap();
-
-        let key_entries = keys
-            .iter()
-            .filter_map(|k| {
-                for kv in kvs.iter() {
-                    if &kv.0 == &k.0 {
-                        return Some((
-                            kv.0.clone(),
-                            Entry {
-                                key: kv.0.clone(),
-                                value: Some(kv.1.clone()),
-                                expire_at_ms: Some(
-                                    (Utc::now() + chrono::Duration::from_std(expire_time).unwrap())
+        mfg.work(batch_key, async move {
+            let kvs = (mloader)(loader_keys.clone()).await?;
+            let key_entries = loader_keys
+                .iter()
+                .filter_map(|k| {
+                    for kv in kvs.iter() {
+                        if kv.0 == k.0 {
+                            return Some((
+                                kv.0.clone(),
+                                Entry {
+                                    key: kv.0.clone(),
+                                    value: Some(kv.1.clone()),
+                                    expire_at_ms: Some(
+                                        (Utc::now()
+                                            + chrono::Duration::from_std(expire_time).unwrap())
                                         .timestamp_millis(),
+                                    ),
+                                },
+                            ));
+                        }
+                    }
+                    cache_none.then(|| {
+                        (
+                            k.0.clone(),
+                            Entry {
+                                key: k.0.clone(),
+                                value: None,
+                                expire_at_ms: Some(
+                                    (Utc::now()
+                                        + chrono::Duration::from_std(none_value_expire_time)
+                                            .unwrap())
+                                    .timestamp_millis(),
                                 ),
                             },
-                        ));
-                    }
-                }
-                cache_none.then(|| {
-                    (
-                        k.0.clone(),
-                        Entry {
-                            key: k.0.clone(),
-                            value: None,
-                            expire_at_ms: Some(
-                                (Utc::now()
-                                    + chrono::Duration::from_std(none_value_expire_time).unwrap())
-                                .timestamp_millis(),
-                            ),
-                        },
-                    )
+                        )
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>();
 
-        if !key_entries.is_empty() {
-            if async_set_cache {
-                let key_entries = key_entries.clone();
-                tokio::spawn(async move {
-                    let _ = cache
-                        .mset(&key_entries)
-                        .await
-                        .inspect_err(|e| error!("mset cache failed, error: {e}"));
-                });
-            } else {
-                cache.mset(&key_entries).await?;
+            if !key_entries.is_empty() {
+                if async_set_cache {
+                    let cache_entries = key_entries.clone();
+                    tokio::spawn(async move {
+                        let _ = cache
+                            .mset(&cache_entries)
+                            .await
+                            .inspect_err(|e| error!("mset cache failed, error: {e}"));
+                    });
+                } else {
+                    cache.mset(&key_entries).await?;
+                }
             }
-        }
 
-        Ok(key_entries.into_iter().map(|(_, e)| e).collect::<Vec<_>>())
+            Ok(key_entries.into_iter().map(|(_, entry)| entry).collect())
+        })
+        .await
     }
 
     async fn filter_sync_source_keys(
@@ -316,28 +322,29 @@ where
         entries: &[Entry<K, V>],
         keys: &[(K, E)],
         use_expired_data: bool,
-    ) {
+    ) -> Result<()> {
         if use_expired_data && !self.manually_refresh {
             let expired_keys = entries
                 .iter()
                 .filter_map(|e| e.is_expired().then(|| e.key.clone()))
                 .collect::<Vec<_>>();
 
-            let _ = self
-                .refresh(
-                    &keys
-                        .iter()
-                        .filter_map(|k| {
-                            if expired_keys.contains(&k.0) {
-                                Some(k.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>(),
-                )
-                .await;
+            self.refresh(
+                &keys
+                    .iter()
+                    .filter_map(|k| {
+                        if expired_keys.contains(&k.0) {
+                            Some(k.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
         }
+
+        Ok(())
     }
 
     async fn filter_unexpired_entry(
@@ -379,6 +386,14 @@ where
             return self.mget_with_source_first(keys).await;
         }
 
+        let requested_use_expired_data = options.use_expired_data.unwrap_or(self.use_expired_data);
+        let refresh_worker_available = self
+            .async_refresh_channel
+            .load()
+            .as_ref()
+            .is_some_and(|sender| !sender.is_closed());
+        let use_expired_data = requested_use_expired_data && refresh_worker_available;
+
         let mut from = "-";
         let entries = self
             .cache_store
@@ -394,34 +409,13 @@ where
         });
 
         let sync_source_keys = self
-            .filter_sync_source_keys(
-                keys,
-                &entries,
-                match options.use_expired_data {
-                    Some(u) => u,
-                    None => self.use_expired_data,
-                },
-            )
+            .filter_sync_source_keys(keys, &entries, use_expired_data)
             .await;
-        self.check_and_async_source(
-            &entries,
-            keys,
-            match options.use_expired_data {
-                Some(u) => u,
-                None => self.use_expired_data,
-            },
-        )
-        .await;
+        self.check_and_async_source(&entries, keys, use_expired_data)
+            .await?;
 
         let mut entries = self
-            .filter_unexpired_entry(
-                &sync_source_keys,
-                entries,
-                match options.use_expired_data {
-                    Some(u) => u,
-                    None => self.use_expired_data,
-                },
-            )
+            .filter_unexpired_entry(&sync_source_keys, entries, use_expired_data)
             .await;
         if !entries.is_empty() {
             from = "cache";
@@ -626,23 +620,44 @@ where
     }
 
     pub async fn refresh(&self, keys: &[(K, E)]) -> Result<()> {
-        if self.async_refresh_channel.load().is_none() {
+        let Some(sender) = self.async_refresh_channel.load_full() else {
             bail!(AutoCacheError::Unsupported);
-        }
+        };
 
-        let keys_vector = keys.chunks(self.max_batch_size).collect::<Vec<_>>();
-        for keys in keys_vector.into_iter() {
-            let _ = self
-                .async_refresh_channel
-                .load()
-                .as_ref()
-                .unwrap()
-                .send(AsyncSourceTask {
-                    _crate_time: Utc::now(),
-                    keys: keys.to_vec(),
-                })
-                .await
-                .inspect_err(|e| error!("autocache: send async source task failed!, error: {e}"));
+        for keys in keys.chunks(self.max_batch_size) {
+            let all_keys_pending = {
+                let pending_refresh_keys = self.pending_refresh_keys.lock();
+                keys.iter()
+                    .all(|(key, _)| pending_refresh_keys.contains(key))
+            };
+            if all_keys_pending {
+                continue;
+            }
+
+            let permit = sender.reserve().await.map_err(|e| {
+                error!("autocache: reserve async source task failed!, error: {e}");
+                anyhow::anyhow!("reserve async source task failed: {e}")
+            })?;
+            let task_keys = {
+                let mut pending_refresh_keys = self.pending_refresh_keys.lock();
+                keys.iter()
+                    .filter_map(|(key, extra)| {
+                        if pending_refresh_keys.insert(key.clone()) {
+                            Some((key.clone(), extra.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if task_keys.is_empty() {
+                continue;
+            }
+
+            permit.send(AsyncSourceTask {
+                _crate_time: Utc::now(),
+                keys: task_keys,
+            });
         }
 
         Ok(())
@@ -658,7 +673,7 @@ where
 
 impl<K, V, C, E> Drop for AutoCache<K, V, C, E>
 where
-    K: Clone,
+    K: Clone + Eq + Hash,
     V: Clone,
     C: Cache<Key = K, Value = Entry<K, V>>,
 {
@@ -669,7 +684,7 @@ where
 
 impl<K, V, C, E> AutoCache<K, V, C, E>
 where
-    K: Clone,
+    K: Clone + Eq + Hash,
     V: Clone,
     C: Cache<Key = K, Value = Entry<K, V>>,
 {
@@ -681,6 +696,10 @@ where
         Ok(())
     }
 }
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct BatchKey<K>(Vec<K>);
+
 pub(crate) struct AsyncSourceTask<K, E> {
     _crate_time: chrono::DateTime<Utc>,
     keys: Vec<(K, E)>,

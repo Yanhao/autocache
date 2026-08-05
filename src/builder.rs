@@ -1,10 +1,14 @@
 use std::fmt::Debug;
+use std::hash::Hash;
 use std::sync::Arc;
 
 use anyhow::Result;
 use futures::future::BoxFuture;
 
-use crate::{autocache::AutoCache, cache::Cache, entry::Entry, loader::Loader};
+use crate::{
+    autocache::AutoCache, cache::Cache, entry::Entry, error::AutoCacheError, loader::Loader,
+    singleflight::Group,
+};
 
 pub struct AutoCacheBuilder<K, V, C, E>
 where
@@ -32,7 +36,7 @@ where
 
 impl<K, V, C, E> AutoCacheBuilder<K, V, C, E>
 where
-    K: Clone + Debug + PartialEq + AsRef<str> + Sync + Send + 'static,
+    K: Clone + Debug + Eq + Hash + Sync + Send + 'static,
     V: Clone + Debug + Sync + Send + 'static,
     C: Cache<Key = K, Value = Entry<K, V>> + Sync + Send + 'static,
     E: Clone + Debug + Sync + Send + 'static,
@@ -61,6 +65,10 @@ where
         self
     }
 
+    /// Sets a loader for individual cache keys.
+    ///
+    /// For a given `K`, the loader result must not vary based on `E`. Any input
+    /// that changes the cached value must be represented in `K` itself.
     pub fn single_loader(
         mut self,
         l: impl Fn(K, E) -> BoxFuture<'static, Result<Option<V>>> + 'static + Send + Sync,
@@ -69,6 +77,10 @@ where
         self
     }
 
+    /// Sets a loader for batches of cache keys.
+    ///
+    /// For a given `K`, the loader result must not vary based on `E`. Any input
+    /// that changes the cached value must be represented in `K` itself.
     pub fn multi_loader(
         mut self,
         l: impl Fn(Vec<(K, E)>) -> BoxFuture<'static, Result<Vec<(K, V)>>> + 'static + Send + Sync,
@@ -130,10 +142,16 @@ where
         self
     }
 
-    pub fn build(self) -> AutoCache<K, V, C, E> {
+    pub fn build(self) -> Result<AutoCache<K, V, C, E>> {
+        let cache = self.cache.ok_or(AutoCacheError::MissingCache)?;
+        let loader = self.loader.ok_or(AutoCacheError::MissingLoader)?;
+        if self.max_batch_size == 0 {
+            return Err(AutoCacheError::InvalidMaxBatchSize.into());
+        }
+
         let mut ac = AutoCache::<K, V, C, E> {
-            cache_store: Arc::new(self.cache.unwrap()),
-            loader: Arc::new(self.loader.unwrap()),
+            cache_store: Arc::new(cache),
+            loader: Arc::new(loader),
             namespace: self.namespace.clone(),
             cache_none: self.cache_none,
             expire_time: self.expire_time,
@@ -144,10 +162,13 @@ where
             use_expired_data: self.use_expired_data,
             manually_refresh: self.manually_refresh,
 
-            sfg: Arc::new(async_singleflight::Group::new()),
-            mfg: Arc::new(async_singleflight::Group::new()),
+            sfg: Arc::new(Group::new()),
+            mfg: Arc::new(Group::new()),
 
             async_refresh_channel: None.into(),
+            pending_refresh_keys: Arc::new(parking_lot::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             stop_ch: None,
 
             on_metrics: self.on_metrics,
@@ -158,9 +179,9 @@ where
         }
 
         if ac.use_expired_data || ac.manually_refresh {
-            ac.start().unwrap();
+            ac.start()?;
         }
 
-        ac
+        Ok(ac)
     }
 }
