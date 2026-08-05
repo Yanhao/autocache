@@ -316,28 +316,29 @@ where
         entries: &[Entry<K, V>],
         keys: &[(K, E)],
         use_expired_data: bool,
-    ) {
+    ) -> Result<()> {
         if use_expired_data && !self.manually_refresh {
             let expired_keys = entries
                 .iter()
                 .filter_map(|e| e.is_expired().then(|| e.key.clone()))
                 .collect::<Vec<_>>();
 
-            let _ = self
-                .refresh(
-                    &keys
-                        .iter()
-                        .filter_map(|k| {
-                            if expired_keys.contains(&k.0) {
-                                Some(k.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>(),
-                )
-                .await;
+            self.refresh(
+                &keys
+                    .iter()
+                    .filter_map(|k| {
+                        if expired_keys.contains(&k.0) {
+                            Some(k.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
         }
+
+        Ok(())
     }
 
     async fn filter_unexpired_entry(
@@ -379,6 +380,14 @@ where
             return self.mget_with_source_first(keys).await;
         }
 
+        let requested_use_expired_data = options.use_expired_data.unwrap_or(self.use_expired_data);
+        let refresh_worker_available = self
+            .async_refresh_channel
+            .load()
+            .as_ref()
+            .is_some_and(|sender| !sender.is_closed());
+        let use_expired_data = requested_use_expired_data && refresh_worker_available;
+
         let mut from = "-";
         let entries = self
             .cache_store
@@ -394,34 +403,13 @@ where
         });
 
         let sync_source_keys = self
-            .filter_sync_source_keys(
-                keys,
-                &entries,
-                match options.use_expired_data {
-                    Some(u) => u,
-                    None => self.use_expired_data,
-                },
-            )
+            .filter_sync_source_keys(keys, &entries, use_expired_data)
             .await;
-        self.check_and_async_source(
-            &entries,
-            keys,
-            match options.use_expired_data {
-                Some(u) => u,
-                None => self.use_expired_data,
-            },
-        )
-        .await;
+        self.check_and_async_source(&entries, keys, use_expired_data)
+            .await?;
 
         let mut entries = self
-            .filter_unexpired_entry(
-                &sync_source_keys,
-                entries,
-                match options.use_expired_data {
-                    Some(u) => u,
-                    None => self.use_expired_data,
-                },
-            )
+            .filter_unexpired_entry(&sync_source_keys, entries, use_expired_data)
             .await;
         if !entries.is_empty() {
             from = "cache";
@@ -626,23 +614,22 @@ where
     }
 
     pub async fn refresh(&self, keys: &[(K, E)]) -> Result<()> {
-        if self.async_refresh_channel.load().is_none() {
+        let Some(sender) = self.async_refresh_channel.load_full() else {
             bail!(AutoCacheError::Unsupported);
-        }
+        };
 
         let keys_vector = keys.chunks(self.max_batch_size).collect::<Vec<_>>();
         for keys in keys_vector.into_iter() {
-            let _ = self
-                .async_refresh_channel
-                .load()
-                .as_ref()
-                .unwrap()
+            sender
                 .send(AsyncSourceTask {
                     _crate_time: Utc::now(),
                     keys: keys.to_vec(),
                 })
                 .await
-                .inspect_err(|e| error!("autocache: send async source task failed!, error: {e}"));
+                .map_err(|e| {
+                    error!("autocache: send async source task failed!, error: {e}");
+                    anyhow::anyhow!("send async source task failed: {e}")
+                })?;
         }
 
         Ok(())
