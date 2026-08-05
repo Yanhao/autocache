@@ -30,7 +30,7 @@ The default feature enables the local Moka-backed cache:
 
 ```toml
 [dependencies]
-autocache = "0.3"
+autocache = "0.4"
 anyhow = "1"
 futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
@@ -49,7 +49,7 @@ Available crate features:
 For a local + Redis two-level cache:
 
 ```toml
-autocache = { version = "0.3", features = ["localcache", "rediscache", "twolevelcache"] }
+autocache = { version = "0.4", features = ["localcache", "rediscache", "twolevelcache"] }
 redis = { version = "0.26", features = ["tokio-comp"] }
 serde = { version = "1", features = ["derive"] }
 ```
