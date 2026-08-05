@@ -139,6 +139,66 @@ async fn test_request_scoped_expired_data_falls_back_to_sync_source_without_work
     assert_eq!(source_calls.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_stale_reads_enqueue_only_one_refresh_per_key() {
+    let source_calls = Arc::new(AtomicUsize::new(0));
+    let loader_calls = source_calls.clone();
+    let refresh_started = Arc::new(tokio::sync::Notify::new());
+    let loader_refresh_started = refresh_started.clone();
+    let release_refresh = Arc::new(tokio::sync::Notify::new());
+    let loader_release_refresh = release_refresh.clone();
+
+    let ac = Arc::new(
+        AutoCache::builder()
+            .cache(LocalCache::new(LocalCacheOption::default()))
+            .expire_time(std::time::Duration::ZERO)
+            .use_expired_data(true)
+            .single_loader(move |key: String, ()| {
+                let loader_calls = loader_calls.clone();
+                let loader_refresh_started = loader_refresh_started.clone();
+                let loader_release_refresh = loader_release_refresh.clone();
+                async move {
+                    let generation = loader_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if generation == 2 {
+                        loader_refresh_started.notify_one();
+                        loader_release_refresh.notified().await;
+                    }
+                    Ok(Some(format!("{key}-{generation}")))
+                }
+                .boxed()
+            })
+            .build()
+            .unwrap(),
+    );
+
+    let key = "test-key".to_string();
+    let first = ac.mget(&[(key.clone(), ())]).await.unwrap();
+    assert_eq!(first, vec![(key.clone(), "test-key-1".to_string())]);
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+    let mut reads = Vec::new();
+    for _ in 0..32 {
+        let ac = ac.clone();
+        let key = key.clone();
+        reads.push(tokio::spawn(
+            async move { ac.mget(&[(key, ())]).await.unwrap() },
+        ));
+    }
+
+    refresh_started.notified().await;
+    for read in reads {
+        assert_eq!(
+            read.await.unwrap(),
+            vec![(key.clone(), "test-key-1".to_string())]
+        );
+    }
+    assert_eq!(source_calls.load(Ordering::SeqCst), 2);
+
+    release_refresh.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(source_calls.load(Ordering::SeqCst), 2);
+}
+
 #[test]
 fn test_builder_returns_errors_instead_of_panicking_for_invalid_configuration() {
     type StringCache = LocalCache<String, Entry<String, String>>;

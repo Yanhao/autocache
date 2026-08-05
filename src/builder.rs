@@ -156,6 +156,7 @@ where
             mfg: Arc::new(async_singleflight::Group::new()),
 
             async_refresh_channel: None.into(),
+            pending_refresh_keys: Arc::new(parking_lot::Mutex::new(Vec::new())),
             stop_ch: None,
 
             on_metrics: self.on_metrics,

@@ -39,6 +39,7 @@ where
 
     pub(crate) async_refresh_channel:
         ArcSwapOption<tokio::sync::mpsc::Sender<AsyncSourceTask<K, E>>>,
+    pub(crate) pending_refresh_keys: Arc<parking_lot::Mutex<Vec<K>>>,
     pub(crate) stop_ch: Option<tokio::sync::mpsc::Sender<()>>,
 
     pub(crate) on_metrics:
@@ -73,6 +74,7 @@ where
         let none_value_expire_time = self.none_value_expire_time;
         let sfg = self.sfg.clone();
         let mfg = self.mfg.clone();
+        let pending_refresh_keys = self.pending_refresh_keys.clone();
 
         runtime.spawn(async move {
             loop {
@@ -84,8 +86,9 @@ where
                         let Some(t) = t else {
                             continue;
                         };
+                        let task_keys = t.keys.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
 
-                        let _ = match *loader {
+                        let result = match *loader {
                             Loader::SingleLoader(_) => {
                                 Self::source_by_sloader(
                                     &t.keys,
@@ -113,12 +116,20 @@ where
                                 .await.inspect_err(|e| error!("async source by mloader failed, error {e}"))
                             }
                         };
+                        Self::remove_pending_refresh_keys(&pending_refresh_keys, &task_keys);
+                        let _ = result;
                     }
                 }
             }
         });
 
         Ok(())
+    }
+
+    fn remove_pending_refresh_keys(pending_refresh_keys: &parking_lot::Mutex<Vec<K>>, keys: &[K]) {
+        pending_refresh_keys
+            .lock()
+            .retain(|pending_key| !keys.contains(pending_key));
     }
 
     async fn source_by_sloader(
@@ -621,18 +632,41 @@ where
             bail!(AutoCacheError::Unsupported);
         };
 
-        let keys_vector = keys.chunks(self.max_batch_size).collect::<Vec<_>>();
-        for keys in keys_vector.into_iter() {
-            sender
-                .send(AsyncSourceTask {
-                    _crate_time: Utc::now(),
-                    keys: keys.to_vec(),
-                })
-                .await
-                .map_err(|e| {
-                    error!("autocache: send async source task failed!, error: {e}");
-                    anyhow::anyhow!("send async source task failed: {e}")
-                })?;
+        for keys in keys.chunks(self.max_batch_size) {
+            let all_keys_pending = {
+                let pending_refresh_keys = self.pending_refresh_keys.lock();
+                keys.iter()
+                    .all(|(key, _)| pending_refresh_keys.contains(key))
+            };
+            if all_keys_pending {
+                continue;
+            }
+
+            let permit = sender.reserve().await.map_err(|e| {
+                error!("autocache: reserve async source task failed!, error: {e}");
+                anyhow::anyhow!("reserve async source task failed: {e}")
+            })?;
+            let task_keys = {
+                let mut pending_refresh_keys = self.pending_refresh_keys.lock();
+                keys.iter()
+                    .filter_map(|(key, extra)| {
+                        if pending_refresh_keys.contains(key) {
+                            None
+                        } else {
+                            pending_refresh_keys.push(key.clone());
+                            Some((key.clone(), extra.clone()))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if task_keys.is_empty() {
+                continue;
+            }
+
+            permit.send(AsyncSourceTask {
+                _crate_time: Utc::now(),
+                keys: task_keys,
+            });
         }
 
         Ok(())
