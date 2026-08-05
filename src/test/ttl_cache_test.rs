@@ -31,7 +31,8 @@ async fn test_builder() {
             .cache(ttl_cache)
             .expire_time(std::time::Duration::from_secs(60))
             .single_loader(|key: String, ()| async move { Ok(Some(key.clone())) }.boxed())
-            .build(),
+            .build()
+            .unwrap(),
     )));
 
     let v1 = AC

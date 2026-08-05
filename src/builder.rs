@@ -4,7 +4,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures::future::BoxFuture;
 
-use crate::{autocache::AutoCache, cache::Cache, entry::Entry, loader::Loader};
+use crate::{
+    autocache::AutoCache, cache::Cache, entry::Entry, error::AutoCacheError, loader::Loader,
+};
 
 pub struct AutoCacheBuilder<K, V, C, E>
 where
@@ -130,10 +132,16 @@ where
         self
     }
 
-    pub fn build(self) -> AutoCache<K, V, C, E> {
+    pub fn build(self) -> Result<AutoCache<K, V, C, E>> {
+        let cache = self.cache.ok_or(AutoCacheError::MissingCache)?;
+        let loader = self.loader.ok_or(AutoCacheError::MissingLoader)?;
+        if self.max_batch_size == 0 {
+            return Err(AutoCacheError::InvalidMaxBatchSize.into());
+        }
+
         let mut ac = AutoCache::<K, V, C, E> {
-            cache_store: Arc::new(self.cache.unwrap()),
-            loader: Arc::new(self.loader.unwrap()),
+            cache_store: Arc::new(cache),
+            loader: Arc::new(loader),
             namespace: self.namespace.clone(),
             cache_none: self.cache_none,
             expire_time: self.expire_time,
@@ -158,9 +166,9 @@ where
         }
 
         if ac.use_expired_data || ac.manually_refresh {
-            ac.start().unwrap();
+            ac.start()?;
         }
 
-        ac
+        Ok(ac)
     }
 }

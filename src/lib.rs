@@ -27,4 +27,5 @@ pub use codec::Codec;
 #[cfg(feature = "serilize")]
 pub use entry::SerilizableEntryTrait;
 pub use entry::{Entry, EntryTrait};
+pub use error::AutoCacheError;
 pub use options::Options;

@@ -134,7 +134,8 @@ mod redis_integration {
                 }
                 .boxed()
             })
-            .build();
+            .build()
+            .unwrap();
 
         let v1 = ac.mget(&[("test-key1".to_string(), ())]).await.unwrap();
         dbg!(&v1);

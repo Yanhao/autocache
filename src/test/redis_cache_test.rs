@@ -1,7 +1,7 @@
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 
-use crate::{redis_cache::RedisCache, AutoCache, Codec};
+use crate::{redis_cache::RedisCache, AutoCache, Cache, Codec, Entry};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Item {
@@ -10,6 +10,34 @@ struct Item {
 }
 
 impl Codec for Item {}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct FailingEncodeItem;
+
+impl Codec for FailingEncodeItem {
+    fn encode(&self) -> anyhow::Result<bytes::Bytes> {
+        anyhow::bail!("encode failed")
+    }
+}
+
+#[tokio::test]
+async fn test_mset_propagates_encode_errors() {
+    let redis_cli = redis::Client::open("redis://127.0.0.1:1/").unwrap();
+    let cache: RedisCache<String, Entry<String, FailingEncodeItem>> = RedisCache::new(redis_cli);
+    let entry = Entry {
+        key: "test-key".to_string(),
+        value: Some(FailingEncodeItem),
+        expire_at_ms: None,
+    };
+
+    let error = cache
+        .mset(&[("test-key".to_string(), entry)])
+        .await
+        .err()
+        .unwrap();
+
+    assert_eq!(error.to_string(), "encode failed");
+}
 
 #[tokio::test]
 async fn test_redis_cache() {
@@ -30,7 +58,8 @@ async fn test_redis_cache() {
             }
             .boxed()
         })
-        .build();
+        .build()
+        .unwrap();
 
     let v1 = ac.mget(&[("test-key1".to_string(), ())]).await.unwrap();
     dbg!(&v1);

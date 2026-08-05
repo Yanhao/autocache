@@ -57,6 +57,9 @@ where
     }
 
     pub(crate) fn start(&mut self) -> Result<()> {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| AutoCacheError::RuntimeUnavailable)?;
+
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         self.stop_ch.replace(tx);
 
@@ -71,7 +74,7 @@ where
         let sfg = self.sfg.clone();
         let mfg = self.mfg.clone();
 
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             loop {
                 tokio::select! {
                     _ = rx.recv() => {

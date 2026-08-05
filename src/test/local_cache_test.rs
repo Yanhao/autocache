@@ -8,7 +8,7 @@ use futures::FutureExt;
 use crate::{
     autocache::AutoCache,
     local_cache::{LocalCache, LocalCacheOption},
-    Options,
+    Entry, Options,
 };
 
 fn on_metrics(_method: &str, _is_error: bool, _ns: &str, _from: &str, _cache_name: &str) {}
@@ -47,7 +47,8 @@ async fn test_builder() {
             }
             .boxed()
         })
-        .build();
+        .build()
+        .unwrap();
 
     let v1 = ac.mget(&[("test-key1".to_string(), ())]).await.unwrap();
     dbg!(&v1);
@@ -114,7 +115,8 @@ async fn test_request_scoped_expired_data_falls_back_to_sync_source_without_work
             }
             .boxed()
         })
-        .build();
+        .build()
+        .unwrap();
 
     let key = "test-key".to_string();
     let first = ac.mget(&[(key.clone(), ())]).await.unwrap();
@@ -135,4 +137,46 @@ async fn test_request_scoped_expired_data_falls_back_to_sync_source_without_work
 
     assert_eq!(second, vec![(key, "test-key-2".to_string())]);
     assert_eq!(source_calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn test_builder_returns_errors_instead_of_panicking_for_invalid_configuration() {
+    type StringCache = LocalCache<String, Entry<String, String>>;
+    type StringAutoCache = AutoCache<String, String, StringCache, ()>;
+
+    let missing_cache = StringAutoCache::builder()
+        .single_loader(|key: String, ()| async move { Ok(Some(key)) }.boxed())
+        .build();
+    assert_eq!(
+        missing_cache.err().unwrap().to_string(),
+        "cache is required"
+    );
+
+    let missing_loader = StringAutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .build();
+    assert_eq!(
+        missing_loader.err().unwrap().to_string(),
+        "loader is required"
+    );
+
+    let invalid_batch_size = StringAutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .single_loader(|key: String, ()| async move { Ok(Some(key)) }.boxed())
+        .max_batch_size(0)
+        .build();
+    assert_eq!(
+        invalid_batch_size.err().unwrap().to_string(),
+        "max_batch_size must be greater than zero"
+    );
+
+    let missing_runtime = StringAutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .single_loader(|key: String, ()| async move { Ok(Some(key)) }.boxed())
+        .use_expired_data(true)
+        .build();
+    assert_eq!(
+        missing_runtime.err().unwrap().to_string(),
+        "a Tokio runtime is required when background refresh is enabled"
+    );
 }
