@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use crate::{cache::Cache, entry::EntryTrait};
 
 pub struct TwoLevelCache<K, V, L1, L2> {
@@ -22,7 +24,7 @@ impl<K, V, L1, L2> TwoLevelCache<K, V, L1, L2> {
 
 impl<K, V, L1, L2> Cache for TwoLevelCache<K, V, L1, L2>
 where
-    K: Ord + Sync,
+    K: Clone + Ord + Sync,
     V: Clone + Sync + EntryTrait<K>,
     L1: Cache<Key = K, Value = V> + Sync,
     L2: Cache<Key = K, Value = V> + Sync,
@@ -32,28 +34,32 @@ where
 
     async fn mget(&self, keys: &[Self::Key]) -> anyhow::Result<Vec<Self::Value>> {
         let mut l1_entries = self.local_cache.mget(keys).await?;
-        let l1_missed_keys = l1_entries
+        let l1_hit_keys = l1_entries
             .iter()
-            .filter_map(|e| {
-                let k = e.get_key();
-                if keys.contains(&k) {
-                    None
-                } else {
-                    Some(k)
-                }
-            })
+            .map(EntryTrait::get_key)
+            .collect::<BTreeSet<_>>();
+        let l1_missed_keys = keys
+            .iter()
+            .filter(|key| !l1_hit_keys.contains(*key))
+            .cloned()
             .collect::<Vec<_>>();
 
+        if l1_missed_keys.is_empty() {
+            return Ok(l1_entries);
+        }
+
         let mut l2_entries = self.redis_cache.mget(&l1_missed_keys).await?;
-        self.local_cache
-            .mset(
-                &l2_entries
-                    .clone()
-                    .into_iter()
-                    .map(|e| (e.get_key(), e))
-                    .collect::<Vec<_>>(),
-            )
-            .await?;
+        if !l2_entries.is_empty() {
+            self.local_cache
+                .mset(
+                    &l2_entries
+                        .clone()
+                        .into_iter()
+                        .map(|e| (e.get_key(), e))
+                        .collect::<Vec<_>>(),
+                )
+                .await?;
+        }
 
         l1_entries.append(&mut l2_entries);
 
