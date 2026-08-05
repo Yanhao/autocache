@@ -35,6 +35,7 @@ where
     pub(crate) source_first: bool,
     pub(crate) max_batch_size: usize,
     pub(crate) async_set_cache: bool,
+    pub(crate) async_cache_write_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) use_expired_data: bool, // means async source
     pub(crate) manually_refresh: bool,
 
@@ -76,6 +77,7 @@ where
         let sfg = self.sfg.clone();
         let mfg = self.mfg.clone();
         let pending_refresh_keys = self.pending_refresh_keys.clone();
+        let async_cache_write_permits = self.async_cache_write_permits.clone();
 
         runtime.spawn(async move {
             loop {
@@ -100,6 +102,7 @@ where
                                     expire_time,
                                     none_value_expire_time,
                                     false,
+                                    async_cache_write_permits.clone(),
                                 )
                                 .await.inspect_err(|e| error!("async source by sloader failed, error {e}"))
                             }
@@ -113,6 +116,7 @@ where
                                     expire_time,
                                     none_value_expire_time,
                                     false,
+                                    async_cache_write_permits.clone(),
                                 )
                                 .await.inspect_err(|e| error!("async source by mloader failed, error {e}"))
                             }
@@ -141,16 +145,30 @@ where
         cache: Arc<C>,
         entries: Vec<(K, Entry<K, V>)>,
         async_set_cache: bool,
+        async_cache_write_permits: Arc<tokio::sync::Semaphore>,
     ) {
         if async_set_cache {
             match tokio::runtime::Handle::try_current() {
                 Ok(runtime) => {
-                    runtime.spawn(async move {
-                        let _ = cache
-                            .mset(&entries)
-                            .await
-                            .inspect_err(|e| error!("mset cache failed, error: {e}"));
-                    });
+                    match async_cache_write_permits.try_acquire_owned() {
+                        Ok(permit) => {
+                            runtime.spawn(async move {
+                                let _permit = permit;
+                                let _ = cache
+                                    .mset(&entries)
+                                    .await
+                                    .inspect_err(|e| error!("mset cache failed, error: {e}"));
+                            });
+                        }
+                        Err(error) => {
+                            warn!(
+                                cache = cache.name(),
+                                entry_count = entries.len(),
+                                error = %error,
+                                "autocache: async cache write limit reached; skipping cache fill"
+                            );
+                        }
+                    }
                     return;
                 }
                 Err(error) => {
@@ -187,6 +205,7 @@ where
         expire_time: std::time::Duration,
         none_value_expire_time: std::time::Duration,
         async_set_cache: bool,
+        async_cache_write_permits: Arc<tokio::sync::Semaphore>,
     ) -> Result<Vec<Entry<K, V>>> {
         let Loader::<K, V, E>::SingleLoader(ref sloader) = *loader else {
             unreachable!();
@@ -198,6 +217,7 @@ where
             let loader_key = key.clone();
             let loader_extra = extra.clone();
             let loader_cache = cache.clone();
+            let loader_cache_write_permits = async_cache_write_permits.clone();
             let entry = sfg
                 .work(key.clone(), async move {
                     let value = (sloader)(loader_key.clone(), loader_extra).await?;
@@ -239,6 +259,7 @@ where
                         loader_cache,
                         vec![(loader_key.clone(), entry.clone())],
                         async_set_cache,
+                        loader_cache_write_permits,
                     )
                     .await;
 
@@ -263,6 +284,7 @@ where
         expire_time: std::time::Duration,
         none_value_expire_time: std::time::Duration,
         async_set_cache: bool,
+        async_cache_write_permits: Arc<tokio::sync::Semaphore>,
     ) -> Result<Vec<Entry<K, V>>> {
         let Loader::<K, V, E>::MultiLoader(ref mloader) = *loader else {
             unreachable!();
@@ -312,7 +334,13 @@ where
             }
 
             if !key_entries.is_empty() {
-                Self::set_cache_entries(cache, key_entries.clone(), async_set_cache).await;
+                Self::set_cache_entries(
+                    cache,
+                    key_entries.clone(),
+                    async_set_cache,
+                    async_cache_write_permits,
+                )
+                .await;
             }
 
             Ok(key_entries.into_iter().map(|(_, entry)| entry).collect())
@@ -489,6 +517,7 @@ where
                         Some(a) => a,
                         None => self.async_set_cache,
                     },
+                    self.async_cache_write_permits.clone(),
                 )
                 .await
                 .inspect_err(|_| {
@@ -531,6 +560,7 @@ where
                                     Some(a) => a,
                                     None => self.async_set_cache,
                                 },
+                                self.async_cache_write_permits.clone(),
                             )
                             .await?,
                         );
@@ -587,6 +617,7 @@ where
                     expire_time,
                     none_value_expire_time,
                     async_set_cache,
+                    self.async_cache_write_permits.clone(),
                 )
                 .await?
             }
@@ -605,6 +636,7 @@ where
                             expire_time,
                             none_value_expire_time,
                             async_set_cache,
+                            self.async_cache_write_permits.clone(),
                         )
                         .await?,
                     );

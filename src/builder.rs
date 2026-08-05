@@ -10,6 +10,8 @@ use crate::{
     singleflight::Group,
 };
 
+const DEFAULT_MAX_CONCURRENT_ASYNC_CACHE_WRITES: usize = 64;
+
 pub struct AutoCacheBuilder<K, V, C, E>
 where
     K: Clone,
@@ -25,6 +27,7 @@ where
     pub(crate) source_first: bool,
     pub(crate) max_batch_size: usize,
     pub(crate) async_set_cache: bool,
+    pub(crate) max_concurrent_async_cache_writes: usize,
     pub(crate) manually_refresh: bool,
 
     pub(crate) use_expired_data: bool,
@@ -49,6 +52,7 @@ where
             none_value_expire_time: std::time::Duration::from_secs(60),
             max_batch_size: 100,
             async_set_cache: false,
+            max_concurrent_async_cache_writes: DEFAULT_MAX_CONCURRENT_ASYNC_CACHE_WRITES,
             cache_none: false,
 
             source_first: false,
@@ -123,8 +127,23 @@ where
         self
     }
 
+    /// Enables best-effort asynchronous cache fills.
+    ///
+    /// Async fills are unordered and limited by
+    /// [`Self::max_concurrent_async_cache_writes`]. A fill is skipped when the
+    /// limit is reached. If no Tokio runtime is available, the fill runs
+    /// synchronously instead.
     pub fn async_set_cache(mut self, t: bool) -> Self {
         self.async_set_cache = t;
+        self
+    }
+
+    /// Sets the maximum number of concurrent best-effort async cache writes.
+    ///
+    /// The default is 64. Additional fills are skipped while the limit is
+    /// reached. The value must be greater than zero.
+    pub fn max_concurrent_async_cache_writes(mut self, limit: usize) -> Self {
+        self.max_concurrent_async_cache_writes = limit;
         self
     }
 
@@ -162,6 +181,9 @@ where
         if self.max_batch_size == 0 {
             return Err(AutoCacheError::InvalidMaxBatchSize.into());
         }
+        if self.max_concurrent_async_cache_writes == 0 {
+            return Err(AutoCacheError::InvalidMaxConcurrentAsyncCacheWrites.into());
+        }
 
         let mut ac = AutoCache::<K, V, C, E> {
             cache_store: Arc::new(cache),
@@ -173,6 +195,9 @@ where
             source_first: self.source_first,
             max_batch_size: self.max_batch_size,
             async_set_cache: self.async_set_cache,
+            async_cache_write_permits: Arc::new(tokio::sync::Semaphore::new(
+                self.max_concurrent_async_cache_writes,
+            )),
             use_expired_data: self.use_expired_data,
             manually_refresh: self.manually_refresh,
 

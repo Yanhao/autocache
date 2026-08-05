@@ -8,7 +8,7 @@ use futures::FutureExt;
 use crate::{
     autocache::AutoCache,
     local_cache::{LocalCache, LocalCacheOption},
-    Entry, Options,
+    Cache, Entry, Options,
 };
 
 fn on_metrics(_method: &str, _is_error: bool, _ns: &str, _from: &str, _cache_name: &str) {}
@@ -31,6 +31,47 @@ fn source_first_metrics(_method: &str, is_error: bool, _ns: &str, from: &str, _c
 struct Item {
     count: u32,
     message: String,
+}
+
+#[derive(Clone)]
+struct BlockingWriteCache {
+    started: Arc<AtomicUsize>,
+    completed: Arc<AtomicUsize>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl BlockingWriteCache {
+    fn new() -> Self {
+        Self {
+            started: Arc::new(AtomicUsize::new(0)),
+            completed: Arc::new(AtomicUsize::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+impl Cache for BlockingWriteCache {
+    type Key = String;
+    type Value = Entry<String, String>;
+
+    async fn mget(&self, _keys: &[Self::Key]) -> anyhow::Result<Vec<Self::Value>> {
+        Ok(Vec::new())
+    }
+
+    async fn mset(&self, _kvs: &[(Self::Key, Self::Value)]) -> anyhow::Result<()> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        self.release.acquire().await?.forget();
+        self.completed.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn mdel(&self, _keys: &[Self::Key]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "blocking-write-cache"
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -365,6 +406,49 @@ fn test_async_cache_fill_falls_back_without_tokio_runtime() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_async_cache_fill_is_skipped_when_concurrency_limit_is_reached() {
+    const WRITE_LIMIT: usize = 2;
+
+    let cache = BlockingWriteCache::new();
+    let observer = cache.clone();
+    let ac = AutoCache::builder()
+        .cache(cache)
+        .source_first(true)
+        .async_set_cache(true)
+        .max_concurrent_async_cache_writes(WRITE_LIMIT)
+        .single_loader(|key: String, ()| async move { Ok(Some(key)) }.boxed())
+        .build()
+        .unwrap();
+
+    for index in 0..=WRITE_LIMIT {
+        let key = format!("test-key-{index}");
+        assert_eq!(
+            ac.mget(&[(key.clone(), ())]).await.unwrap(),
+            vec![(key.clone(), key)]
+        );
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while observer.started.load(Ordering::SeqCst) < WRITE_LIMIT {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(observer.started.load(Ordering::SeqCst), WRITE_LIMIT);
+
+    observer.release.add_permits(WRITE_LIMIT);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while observer.completed.load(Ordering::SeqCst) < WRITE_LIMIT {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(observer.completed.load(Ordering::SeqCst), WRITE_LIMIT);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_stale_reads_enqueue_only_one_refresh_per_key() {
     let source_calls = Arc::new(AtomicUsize::new(0));
     let loader_calls = source_calls.clone();
@@ -597,6 +681,16 @@ fn test_builder_returns_errors_instead_of_panicking_for_invalid_configuration() 
     assert_eq!(
         invalid_batch_size.err().unwrap().to_string(),
         "max_batch_size must be greater than zero"
+    );
+
+    let invalid_async_write_limit = StringAutoCache::builder()
+        .cache(LocalCache::new(LocalCacheOption::default()))
+        .single_loader(|key: String, ()| async move { Ok(Some(key)) }.boxed())
+        .max_concurrent_async_cache_writes(0)
+        .build();
+    assert_eq!(
+        invalid_async_write_limit.err().unwrap().to_string(),
+        "max_concurrent_async_cache_writes must be greater than zero"
     );
 
     let missing_runtime = StringAutoCache::builder()

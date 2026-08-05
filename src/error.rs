@@ -9,6 +9,8 @@ pub enum AutoCacheError {
     MissingLoader,
     #[error("max_batch_size must be greater than zero")]
     InvalidMaxBatchSize,
+    #[error("max_concurrent_async_cache_writes must be greater than zero")]
+    InvalidMaxConcurrentAsyncCacheWrites,
     #[error("a Tokio runtime is required for background tasks")]
     RuntimeUnavailable,
     #[error("unsupported behaviour")]
