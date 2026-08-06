@@ -1,12 +1,12 @@
 use std::fmt::Debug;
 
-#[cfg(feature = "serilize")]
+#[cfg(feature = "serialize")]
 use bytes::Buf;
 use chrono::Utc;
-#[cfg(feature = "serilize")]
+#[cfg(feature = "serialize")]
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-#[cfg(feature = "serilize")]
+#[cfg(feature = "serialize")]
 use crate::codec::Codec;
 
 #[derive(Debug, Clone)]
@@ -35,16 +35,16 @@ where
     }
 }
 
-#[cfg(feature = "serilize")]
-pub trait SerilizableEntryTrait {
+#[cfg(feature = "serialize")]
+pub trait SerializableEntryTrait {
     fn decode(data: bytes::Bytes) -> anyhow::Result<Self>
     where
         Self: Sized;
     fn encode(&self) -> anyhow::Result<bytes::Bytes>;
 }
 
-#[cfg(feature = "serilize")]
-impl<K, V> SerilizableEntryTrait for Entry<K, V>
+#[cfg(feature = "serialize")]
+impl<K, V> SerializableEntryTrait for Entry<K, V>
 where
     K: Serialize + DeserializeOwned + Clone,
     V: Codec,
@@ -81,7 +81,7 @@ where
     }
 }
 
-#[cfg(feature = "serilize")]
+#[cfg(feature = "serialize")]
 #[derive(Serialize, Deserialize)]
 struct EntryInner<K> {
     key: K,
@@ -89,12 +89,12 @@ struct EntryInner<K> {
     expire_at_ms: Option<i64>,
 }
 
-#[cfg(all(test, feature = "serilize"))]
+#[cfg(all(test, feature = "serialize"))]
 mod tests {
     use bytes::Bytes;
     use serde::{Deserialize, Serialize};
 
-    use super::{Entry, SerilizableEntryTrait};
+    use super::{Entry, SerializableEntryTrait};
     use crate::Codec;
 
     #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

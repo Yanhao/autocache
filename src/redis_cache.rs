@@ -5,7 +5,7 @@ use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use redis::AsyncCommands;
 
-use crate::{cache::Cache, SerilizableEntryTrait};
+use crate::{cache::Cache, SerializableEntryTrait};
 
 pub struct RedisCache<K, V> {
     namespace: ArcSwapOption<String>,
@@ -59,7 +59,7 @@ where
 impl<K, V> Cache for RedisCache<K, V>
 where
     K: Clone + Sync + AsRef<str>,
-    V: Sync + SerilizableEntryTrait,
+    V: Sync + SerializableEntryTrait,
 {
     type Key = K;
     type Value = V;

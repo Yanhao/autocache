@@ -44,7 +44,7 @@ Available crate features:
 | `ttlcache` | Enables `TtlCache`. |
 | `rediscache` | Enables `RedisCache` and serialization support. |
 | `twolevelcache` | Enables `TwoLevelCache` and serialization support. |
-| `serilize` | Enables `Codec` and serialized entries. The spelling is part of the current public API. |
+| `serialize` | Enables `Codec` and serialized entries. |
 
 For a local + Redis two-level cache:
 

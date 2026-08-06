@@ -3,7 +3,7 @@
 mod autocache;
 mod builder;
 mod cache;
-#[cfg(feature = "serilize")]
+#[cfg(feature = "serialize")]
 mod codec;
 mod entry;
 mod error;
@@ -25,10 +25,10 @@ mod test;
 pub use autocache::AutoCache;
 pub use builder::AutoCacheBuilder;
 pub use cache::Cache;
-#[cfg(feature = "serilize")]
+#[cfg(feature = "serialize")]
 pub use codec::Codec;
-#[cfg(feature = "serilize")]
-pub use entry::SerilizableEntryTrait;
+#[cfg(feature = "serialize")]
+pub use entry::SerializableEntryTrait;
 pub use entry::{Entry, EntryTrait};
 pub use error::AutoCacheError;
 pub use options::Options;
