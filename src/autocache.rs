@@ -113,7 +113,7 @@ where
     K: Clone + Debug + Eq + Hash + Sync + Send + 'static,
     V: Clone + Debug + Sync + Send + 'static,
     C: Cache<Key = K, Value = Entry<K, V>> + Sync + Send + 'static,
-    E: Clone + Debug + Sync + Send + 'static,
+    E: Clone + Sync + Send + 'static,
 {
     pub fn builder() -> AutoCacheBuilder<K, V, C, E> {
         AutoCacheBuilder::new()
@@ -481,7 +481,10 @@ where
                 Some(key.clone())
             })
             .collect::<Vec<_>>();
-        debug!(msg = "autocache: sync_source_keys", keys = ?sync_source_keys);
+        debug!(
+            msg = "autocache: sync_source_keys",
+            keys = ?sync_source_keys.iter().map(|(key, _)| key).collect::<Vec<_>>()
+        );
 
         sync_source_keys
     }
@@ -587,9 +590,11 @@ where
             .map_err(|error| {
                 Error::from_cache(CacheOperation::Read, self.cache_store.name(), error)
             })?;
-        debug!(msg = "autocache: mget from cache before filter", keys = ?keys, ret = ?{
-            entries.iter().map(|e| e.key.clone()).collect::<Vec<_>>()
-        });
+        debug!(
+            msg = "autocache: mget from cache before filter",
+            keys = ?keys.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            ret = ?entries.iter().map(|e| &e.key).collect::<Vec<_>>()
+        );
 
         let sync_source_keys = self
             .filter_sync_source_keys(keys, &entries, use_expired_data)
@@ -604,9 +609,11 @@ where
             from = "cache";
         }
 
-        debug!(msg = "autocache: mget from cache", keys = ?keys, ret = ?{
-            entries.iter().map(|e| e.key.clone()).collect::<Vec<_>>()
-        });
+        debug!(
+            msg = "autocache: mget from cache",
+            keys = ?keys.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            ret = ?entries.iter().map(|e| &e.key).collect::<Vec<_>>()
+        );
 
         if !sync_source_keys.is_empty() {
             let cache_none = options.cache_none.unwrap_or(self.cache_none);

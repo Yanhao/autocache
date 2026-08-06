@@ -113,7 +113,7 @@ If a loader needs per-request context, use the explicit context API:
 
 ```rust,no_run
 # use autocache::{AutoCache, local_cache::{LocalCache, LocalCacheOption}};
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct RequestContext {
     trace_id: String,
 }

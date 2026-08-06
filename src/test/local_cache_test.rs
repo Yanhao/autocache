@@ -282,6 +282,11 @@ async fn test_builder() {
 
 #[tokio::test]
 async fn test_key_only_and_context_apis() {
+    #[derive(Clone)]
+    struct SensitiveContext {
+        token: String,
+    }
+
     let key_only = AutoCache::builder()
         .cache(LocalCache::new(LocalCacheOption::default()))
         .single_loader(|key: String| async move { Ok(Some(format!("value:{key}"))) })
@@ -297,8 +302,8 @@ async fn test_key_only_and_context_apis() {
     let loader_context = observed_context.clone();
     let with_context = AutoCache::builder()
         .cache(LocalCache::new(LocalCacheOption::default()))
-        .single_loader_with_context(move |key: String, context: String| {
-            *loader_context.lock() = Some(context);
+        .single_loader_with_context(move |key: String, context: SensitiveContext| {
+            *loader_context.lock() = Some(context.token);
             async move { Ok(Some(format!("value:{key}"))) }
         })
         .build()
@@ -306,12 +311,17 @@ async fn test_key_only_and_context_apis() {
 
     assert_eq!(
         with_context
-            .mget_with_context(&[("context-key".to_string(), "trace-123".to_string())])
+            .mget_with_context(&[(
+                "context-key".to_string(),
+                SensitiveContext {
+                    token: "secret-token".to_string(),
+                },
+            )])
             .await
             .unwrap(),
         vec![("context-key".to_string(), "value:context-key".to_string())]
     );
-    assert_eq!(observed_context.lock().as_deref(), Some("trace-123"));
+    assert_eq!(observed_context.lock().as_deref(), Some("secret-token"));
 }
 
 #[tokio::test]

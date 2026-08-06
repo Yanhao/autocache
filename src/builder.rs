@@ -48,7 +48,7 @@ where
     K: Clone + Debug + Eq + Hash + Sync + Send + 'static,
     V: Clone + Debug + Sync + Send + 'static,
     C: Cache<Key = K, Value = Entry<K, V>> + Sync + Send + 'static,
-    E: Clone + Debug + Sync + Send + 'static,
+    E: Clone + Sync + Send + 'static,
 {
     fn default() -> Self {
         Self::new()
@@ -60,7 +60,7 @@ where
     K: Clone + Debug + Eq + Hash + Sync + Send + 'static,
     V: Clone + Debug + Sync + Send + 'static,
     C: Cache<Key = K, Value = Entry<K, V>> + Sync + Send + 'static,
-    E: Clone + Debug + Sync + Send + 'static,
+    E: Clone + Sync + Send + 'static,
 {
     pub fn new() -> Self {
         Self {
