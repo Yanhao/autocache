@@ -1,8 +1,9 @@
 use std::{collections::HashMap, future::Future, hash::Hash, sync::Arc};
 
-use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
 use tokio::sync::watch;
+
+use crate::{Error, Result};
 
 pub(crate) struct Group<K, T>
 where
@@ -33,7 +34,7 @@ where
     T: Clone,
 {
     Running,
-    Done(std::result::Result<T, Arc<str>>),
+    Done(Result<T>),
     LeaderDropped,
 }
 
@@ -71,13 +72,12 @@ where
                 Role::Leader(flight) => {
                     let guard = LeaderGuard::new(self, key.clone(), flight.clone());
                     let Some(leader_future) = future.take() else {
-                        return Err(anyhow!("singleflight leader future is unavailable"));
+                        return Err(Error::SingleFlight {
+                            message: "leader future is unavailable".into(),
+                        });
                     };
                     let result = leader_future.await;
-                    let shared_result = match &result {
-                        Ok(value) => Ok(value.clone()),
-                        Err(error) => Err(Arc::<str>::from(format!("{error:#}"))),
-                    };
+                    let shared_result = result.clone();
 
                     flight.state.send_replace(State::Done(shared_result));
                     guard.finish();
@@ -92,7 +92,7 @@ where
                             }
                         }
                         State::Done(result) => {
-                            return result.map_err(|error| anyhow!(error.to_string()));
+                            return result;
                         }
                         State::LeaderDropped => break,
                     }
@@ -184,6 +184,7 @@ mod tests {
     };
 
     use super::Group;
+    use crate::{Error, LoaderKind};
 
     #[tokio::test]
     async fn concurrent_work_for_the_same_key_runs_once() {
@@ -253,7 +254,7 @@ mod tests {
                 group
                     .work("test-key".to_string(), async move {
                         leader_started.notify_one();
-                        std::future::pending::<anyhow::Result<usize>>().await
+                        std::future::pending::<crate::Result<usize>>().await
                     })
                     .await
             })
@@ -278,5 +279,62 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(result, 42);
+    }
+
+    #[tokio::test]
+    async fn followers_preserve_typed_errors() {
+        let group = Arc::new(Group::<String, usize>::new());
+        let leader_started = Arc::new(tokio::sync::Notify::new());
+        let release_leader = Arc::new(tokio::sync::Semaphore::new(0));
+        let key = "test-key".to_string();
+
+        let leader = {
+            let group = group.clone();
+            let leader_started = leader_started.clone();
+            let release_leader = release_leader.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                group
+                    .work(key, async move {
+                        leader_started.notify_one();
+                        release_leader.acquire_owned().await.unwrap().forget();
+                        Err(Error::loader(
+                            LoaderKind::Single,
+                            anyhow::anyhow!("loader failed"),
+                        ))
+                    })
+                    .await
+            })
+        };
+
+        leader_started.notified().await;
+
+        let follower = {
+            let group = group.clone();
+            let key = key.clone();
+            tokio::spawn(async move { group.work(key, async move { Ok(42) }).await })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while group.follower_count(&key) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        release_leader.add_permits(1);
+
+        for error in [
+            leader.await.unwrap().unwrap_err(),
+            follower.await.unwrap().unwrap_err(),
+        ] {
+            assert!(matches!(
+                error,
+                Error::Loader {
+                    kind: LoaderKind::Single,
+                    ..
+                }
+            ));
+        }
     }
 }

@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use futures::FutureExt;
 use parking_lot::Mutex;
 
-use crate::{twolevel_cache::TwoLevelCache, AutoCache, Cache, Entry};
+use crate::{twolevel_cache::TwoLevelCache, AutoCache, Cache, CacheOperation, Entry, Error};
 
 type TestEntry = Entry<String, String>;
 
@@ -312,7 +312,14 @@ async fn test_explicit_mset_still_propagates_cache_write_errors() {
         .await
         .unwrap_err();
 
-    assert_eq!(error.to_string(), "L2 write unavailable");
+    match error {
+        Error::Cache {
+            operation: CacheOperation::Write,
+            cache: "twolevelcache",
+            source,
+        } => assert_eq!(source.to_string(), "L2 write unavailable"),
+        error => panic!("unexpected error: {error}"),
+    }
 }
 
 #[cfg(all(feature = "localcache", feature = "rediscache"))]

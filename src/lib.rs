@@ -30,5 +30,8 @@ pub use codec::Codec;
 #[cfg(feature = "serialize")]
 pub use entry::SerializableEntryTrait;
 pub use entry::{Entry, EntryTrait};
-pub use error::AutoCacheError;
+pub use error::{
+    CacheOperation, ConfigurationError, Error, ErrorSource, LoaderKind, Result,
+    SerializationOperation,
+};
 pub use options::Options;

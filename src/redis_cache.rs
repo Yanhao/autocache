@@ -88,7 +88,10 @@ where
             )
             .await?;
 
-        res.into_iter().flatten().map(V::decode).collect()
+        res.into_iter()
+            .flatten()
+            .map(|data| V::decode(data).map_err(anyhow::Error::from))
+            .collect()
     }
 
     async fn mset(&self, kvs: &[(Self::Key, Self::Value)]) -> Result<()> {

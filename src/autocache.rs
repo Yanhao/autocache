@@ -1,6 +1,5 @@
 use std::{collections::HashSet, fmt::Debug, hash::Hash, sync::Arc};
 
-use anyhow::{bail, Result};
 use arc_swap::ArcSwapOption;
 use chrono::prelude::*;
 use futures::future::BoxFuture;
@@ -10,10 +9,10 @@ use crate::{
     builder::AutoCacheBuilder,
     cache::Cache,
     entry::{Entry, EntryTrait},
-    error::AutoCacheError,
+    error::ConfigurationError,
     loader::Loader,
     singleflight::Group,
-    Options,
+    CacheOperation, Error, LoaderKind, Options, Result,
 };
 
 pub(crate) type MetricsCallback =
@@ -121,8 +120,8 @@ where
     }
 
     pub(crate) fn start(&mut self) -> Result<()> {
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|_| AutoCacheError::RuntimeUnavailable)?;
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|_| Error::RuntimeUnavailable)?;
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         self.stop_ch.replace(tx);
@@ -207,11 +206,11 @@ where
 
     fn expiration_timestamp(duration: std::time::Duration) -> Result<i64> {
         let duration = chrono::Duration::from_std(duration)
-            .map_err(|_| AutoCacheError::InvalidExpirationDuration)?;
+            .map_err(|_| ConfigurationError::InvalidExpirationDuration)?;
         Utc::now()
             .checked_add_signed(duration)
             .map(|expires_at| expires_at.timestamp_millis())
-            .ok_or_else(|| AutoCacheError::InvalidExpirationDuration.into())
+            .ok_or_else(|| ConfigurationError::InvalidExpirationDuration.into())
     }
 
     fn cache_fill_config(&self, asynchronous: bool) -> CacheFillConfig {
@@ -335,7 +334,9 @@ where
             let loader_cache_fill_config = cache_fill_config.clone();
             let entry = sfg
                 .work(key.clone(), async move {
-                    let value = (sloader)(loader_key.clone(), loader_extra).await?;
+                    let value = (sloader)(loader_key.clone(), loader_extra)
+                        .await
+                        .map_err(|error| Error::loader(LoaderKind::Single, error))?;
 
                     if value.is_none() {
                         debug!(msg = "autocache: source value is none", key = ?loader_key);
@@ -408,7 +409,9 @@ where
         let loader_keys = keys.clone();
 
         mfg.work(batch_key, async move {
-            let kvs = (mloader)(loader_keys.clone()).await?;
+            let kvs = (mloader)(loader_keys.clone())
+                .await
+                .map_err(|error| Error::loader(LoaderKind::Batch, error))?;
             let mut key_entries = Vec::with_capacity(loader_keys.len());
             let mut missing_keys = Vec::new();
 
@@ -580,7 +583,10 @@ where
         let entries = self
             .cache_store
             .mget(&keys.iter().map(|key| key.0.clone()).collect::<Vec<_>>())
-            .await?;
+            .await
+            .map_err(|error| {
+                Error::from_cache(CacheOperation::Read, self.cache_store.name(), error)
+            })?;
         debug!(msg = "autocache: mget from cache before filter", keys = ?keys, ret = ?{
             entries.iter().map(|e| e.key.clone()).collect::<Vec<_>>()
         });
@@ -740,7 +746,9 @@ where
             })
             .collect::<Result<Vec<_>>>()?;
 
-        self.cache_store.mset(&kvs).await?;
+        self.cache_store.mset(&kvs).await.map_err(|error| {
+            Error::from_cache(CacheOperation::Write, self.cache_store.name(), error)
+        })?;
 
         Ok(())
     }
@@ -749,12 +757,14 @@ where
         if keys.is_empty() {
             return Ok(());
         }
-        self.cache_store.mdel(keys).await
+        self.cache_store.mdel(keys).await.map_err(|error| {
+            Error::from_cache(CacheOperation::Delete, self.cache_store.name(), error)
+        })
     }
 
     async fn enqueue_refresh(&self, keys: &[(K, E)], mode: RefreshEnqueueMode) -> Result<()> {
         let Some(sender) = self.async_refresh_channel.load_full() else {
-            bail!(AutoCacheError::Unsupported);
+            return Err(Error::RefreshUnavailable);
         };
 
         for keys in keys.chunks(self.max_batch_size) {
@@ -770,7 +780,7 @@ where
             let permit = match mode {
                 RefreshEnqueueMode::WaitForCapacity => sender.reserve().await.map_err(|error| {
                     error!(%error, "autocache: reserve async source task failed");
-                    anyhow::anyhow!("reserve async source task failed: {error}")
+                    Error::RefreshUnavailable
                 })?,
                 RefreshEnqueueMode::BestEffort => match sender.try_reserve() {
                     Ok(permit) => permit,
@@ -895,7 +905,7 @@ where
     C: Cache<Key = K, Value = Entry<K, V>>,
 {
     fn drop(&mut self) {
-        let _ = self.stop();
+        self.stop();
     }
 }
 
@@ -905,12 +915,10 @@ where
     V: Clone,
     C: Cache<Key = K, Value = Entry<K, V>>,
 {
-    fn stop(&self) -> Result<()> {
+    fn stop(&self) {
         if let Some(s) = self.stop_ch.as_ref() {
-            s.try_send(())?;
+            let _ = s.try_send(());
         }
-
-        Ok(())
     }
 }
 

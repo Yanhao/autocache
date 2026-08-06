@@ -3,15 +3,16 @@ use std::future::Future;
 use std::hash::Hash;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::Result as AnyResult;
 
 use crate::{
     autocache::{AutoCache, MetricsCallback},
     cache::Cache,
     entry::Entry,
-    error::AutoCacheError,
+    error::ConfigurationError,
     loader::Loader,
     singleflight::Group,
+    Result,
 };
 
 const DEFAULT_MAX_CONCURRENT_ASYNC_CACHE_WRITES: usize = 64;
@@ -98,7 +99,7 @@ where
     pub fn single_loader_with_context<F, Fut>(mut self, loader: F) -> Self
     where
         F: Fn(K, E) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<Option<V>>> + Send + 'static,
+        Fut: Future<Output = AnyResult<Option<V>>> + Send + 'static,
     {
         self.loader = Some(Loader::SingleLoader(Box::new(move |key, context| {
             Box::pin(loader(key, context))
@@ -118,7 +119,7 @@ where
     pub fn multi_loader_with_context<F, Fut>(mut self, loader: F) -> Self
     where
         F: Fn(Vec<(K, E)>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<Vec<(K, V)>>> + Send + 'static,
+        Fut: Future<Output = AnyResult<Vec<(K, V)>>> + Send + 'static,
     {
         self.loader = Some(Loader::MultiLoader(Box::new(move |keys| {
             Box::pin(loader(keys))
@@ -218,16 +219,16 @@ where
     }
 
     pub fn build(self) -> Result<AutoCache<K, V, C, E>> {
-        let cache = self.cache.ok_or(AutoCacheError::MissingCache)?;
-        let loader = self.loader.ok_or(AutoCacheError::MissingLoader)?;
+        let cache = self.cache.ok_or(ConfigurationError::MissingCache)?;
+        let loader = self.loader.ok_or(ConfigurationError::MissingLoader)?;
         if self.max_batch_size == 0 {
-            return Err(AutoCacheError::InvalidMaxBatchSize.into());
+            return Err(ConfigurationError::InvalidMaxBatchSize.into());
         }
         if self.max_concurrent_async_cache_writes == 0 {
-            return Err(AutoCacheError::InvalidMaxConcurrentAsyncCacheWrites.into());
+            return Err(ConfigurationError::InvalidMaxConcurrentAsyncCacheWrites.into());
         }
         if self.async_refresh_queue_capacity == 0 {
-            return Err(AutoCacheError::InvalidAsyncRefreshQueueCapacity.into());
+            return Err(ConfigurationError::InvalidAsyncRefreshQueueCapacity.into());
         }
 
         let mut ac = AutoCache::<K, V, C, E> {
@@ -285,7 +286,7 @@ where
     pub fn single_loader<F, Fut>(self, loader: F) -> Self
     where
         F: Fn(K) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<Option<V>>> + Send + 'static,
+        Fut: Future<Output = AnyResult<Option<V>>> + Send + 'static,
     {
         self.single_loader_with_context(move |key, ()| loader(key))
     }
@@ -299,7 +300,7 @@ where
     pub fn multi_loader<F, Fut>(self, loader: F) -> Self
     where
         F: Fn(Vec<K>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<Vec<(K, V)>>> + Send + 'static,
+        Fut: Future<Output = AnyResult<Vec<(K, V)>>> + Send + 'static,
     {
         self.multi_loader_with_context(move |keys| {
             loader(keys.into_iter().map(|(key, ())| key).collect())

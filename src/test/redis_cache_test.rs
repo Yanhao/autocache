@@ -1,7 +1,7 @@
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 
-use crate::{redis_cache::RedisCache, AutoCache, Cache, Codec, Entry};
+use crate::{redis_cache::RedisCache, AutoCache, Codec, Error, SerializationOperation};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Item {
@@ -23,20 +23,25 @@ impl Codec for FailingEncodeItem {
 #[tokio::test]
 async fn test_mset_propagates_encode_errors() {
     let redis_cli = redis::Client::open("redis://127.0.0.1:1/").unwrap();
-    let cache: RedisCache<String, Entry<String, FailingEncodeItem>> = RedisCache::new(redis_cli);
-    let entry = Entry {
-        key: "test-key".to_string(),
-        value: Some(FailingEncodeItem),
-        expire_at_ms: None,
-    };
-
-    let error = cache
-        .mset(&[("test-key".to_string(), entry)])
-        .await
-        .err()
+    let cache = AutoCache::builder()
+        .cache(RedisCache::new(redis_cli))
+        .single_loader(|_key: String| async move { Ok(Some(FailingEncodeItem)) })
+        .build()
         .unwrap();
 
-    assert_eq!(error.to_string(), "encode failed");
+    let error = cache
+        .mset(&[("test-key".to_string(), FailingEncodeItem)])
+        .await
+        .unwrap_err();
+
+    match error {
+        Error::Serialization {
+            operation: SerializationOperation::Encode,
+            codec: "json",
+            source,
+        } => assert_eq!(source.to_string(), "encode failed"),
+        error => panic!("unexpected error: {error}"),
+    }
 }
 
 #[tokio::test]

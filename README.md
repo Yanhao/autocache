@@ -461,6 +461,44 @@ timestamp. Backend operations must return `Send` futures.
 The public `with_cache` method can be used for backend-specific operations
 without exposing ownership of the configured cache.
 
+## Error handling
+
+`AutoCache` operations return `autocache::Result<T>`. Errors retain their
+underlying source and can be matched by category and operation:
+
+```rust
+use autocache::{CacheOperation, ConfigurationError, Error, LoaderKind};
+
+fn classify(error: Error) {
+    match error {
+        Error::Configuration(ConfigurationError::MissingLoader) => {
+            eprintln!("configure a loader before building the cache");
+        }
+        Error::Cache {
+            operation: CacheOperation::Read,
+            cache,
+            source,
+        } => {
+            eprintln!("failed to read {cache}: {source}");
+        }
+        Error::Loader {
+            kind: LoaderKind::Single,
+            source,
+        } => {
+            eprintln!("single loader failed: {source}");
+        }
+        Error::Serialization { source, .. } => {
+            eprintln!("serialization failed: {source}");
+        }
+        _ => {}
+    }
+}
+```
+
+Cache reads, explicit writes, and explicit deletes are distinguished by
+`CacheOperation`. Single-key and batch loader failures are distinguished by
+`LoaderKind`; encode and decode failures use `SerializationOperation`.
+
 ## Operational notes
 
 - `max_batch_size`, `max_concurrent_async_cache_writes`, and

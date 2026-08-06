@@ -8,7 +8,7 @@ use futures::FutureExt;
 use crate::{
     autocache::AutoCache,
     local_cache::{LocalCache, LocalCacheOption},
-    Cache, Entry, EntryTrait, Options,
+    Cache, CacheOperation, ConfigurationError, Entry, EntryTrait, Error, LoaderKind, Options,
 };
 
 fn on_metrics(_method: &str, _is_error: bool, _ns: &str, _from: &str, _cache_name: &str) {}
@@ -161,6 +161,30 @@ impl Cache for FailingDeleteCache {
     }
 }
 
+#[derive(Clone)]
+struct FailingReadCache;
+
+impl Cache for FailingReadCache {
+    type Key = String;
+    type Value = Entry<String, String>;
+
+    async fn mget(&self, _keys: &[Self::Key]) -> anyhow::Result<Vec<Self::Value>> {
+        anyhow::bail!("cache read failed")
+    }
+
+    async fn mset(&self, _kvs: &[(Self::Key, Self::Value)]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn mdel(&self, _keys: &[Self::Key]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "failing-read-cache"
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct TenantKey {
     tenant: &'static str,
@@ -288,6 +312,25 @@ async fn test_key_only_and_context_apis() {
         vec![("context-key".to_string(), "value:context-key".to_string())]
     );
     assert_eq!(observed_context.lock().as_deref(), Some("trace-123"));
+}
+
+#[tokio::test]
+async fn test_cache_read_errors_are_typed() {
+    let cache = AutoCache::builder()
+        .cache(FailingReadCache)
+        .single_loader(|key: String| async move { Ok(Some(key)) })
+        .build()
+        .unwrap();
+
+    let error = cache.mget(&["test-key".to_string()]).await.unwrap_err();
+    assert!(matches!(
+        error,
+        Error::Cache {
+            operation: CacheOperation::Read,
+            cache: "failing-read-cache",
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
@@ -489,10 +532,17 @@ async fn test_source_first_records_success_and_error_metrics() {
         })
         .build()
         .unwrap();
-    failure
+    let error = failure
         .mget(&["failure-key".to_string()])
         .await
         .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::Loader {
+            kind: LoaderKind::Single,
+            ..
+        }
+    ));
 
     assert_eq!(SOURCE_FIRST_METRIC_CALLS.load(Ordering::SeqCst), 2);
     assert_eq!(SOURCE_FIRST_METRIC_ERRORS.load(Ordering::SeqCst), 1);
@@ -527,10 +577,17 @@ async fn test_cache_first_records_multi_loader_errors_and_not_found_source() {
         })
         .build()
         .unwrap();
-    failure
+    let error = failure
         .mget(&["failure-key".to_string()])
         .await
         .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::Loader {
+            kind: LoaderKind::Batch,
+            ..
+        }
+    ));
 
     assert_eq!(CACHE_FIRST_METRIC_SOURCE.load(Ordering::SeqCst), 1);
     assert_eq!(CACHE_FIRST_METRIC_ERRORS.load(Ordering::SeqCst), 1);
@@ -670,22 +727,17 @@ async fn test_out_of_range_expiration_duration_returns_error() {
         .single_loader(|key: String| async move { Ok(Some(key)) }.boxed())
         .build()
         .unwrap();
-    assert_eq!(
-        positive
-            .mget(&["test-key".to_string()])
-            .await
-            .unwrap_err()
-            .to_string(),
-        "expiration duration is out of range"
-    );
-    assert_eq!(
+    assert!(matches!(
+        positive.mget(&["test-key".to_string()]).await.unwrap_err(),
+        Error::Configuration(ConfigurationError::InvalidExpirationDuration)
+    ));
+    assert!(matches!(
         positive
             .mset(&[("test-key".to_string(), "test-value".to_string())])
             .await
-            .unwrap_err()
-            .to_string(),
-        "expiration duration is out of range"
-    );
+            .unwrap_err(),
+        Error::Configuration(ConfigurationError::InvalidExpirationDuration)
+    ));
 
     let negative = AutoCache::builder()
         .cache(LocalCache::new(LocalCacheOption::default()))
@@ -694,14 +746,10 @@ async fn test_out_of_range_expiration_duration_returns_error() {
         .single_loader(|_key: String| async move { Ok(None::<String>) }.boxed())
         .build()
         .unwrap();
-    assert_eq!(
-        negative
-            .mget(&["test-key".to_string()])
-            .await
-            .unwrap_err()
-            .to_string(),
-        "expiration duration is out of range"
-    );
+    assert!(matches!(
+        negative.mget(&["test-key".to_string()]).await.unwrap_err(),
+        Error::Configuration(ConfigurationError::InvalidExpirationDuration)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1015,56 +1063,56 @@ fn test_builder_returns_errors_instead_of_panicking_for_invalid_configuration() 
     let missing_cache = StringAutoCache::builder()
         .single_loader(|key: String| async move { Ok(Some(key)) }.boxed())
         .build();
-    assert_eq!(
-        missing_cache.err().unwrap().to_string(),
-        "cache is required"
-    );
+    assert!(matches!(
+        missing_cache.err().unwrap(),
+        Error::Configuration(ConfigurationError::MissingCache)
+    ));
 
     let missing_loader = StringAutoCache::builder()
         .cache(LocalCache::new(LocalCacheOption::default()))
         .build();
-    assert_eq!(
-        missing_loader.err().unwrap().to_string(),
-        "loader is required"
-    );
+    assert!(matches!(
+        missing_loader.err().unwrap(),
+        Error::Configuration(ConfigurationError::MissingLoader)
+    ));
 
     let invalid_batch_size = StringAutoCache::builder()
         .cache(LocalCache::new(LocalCacheOption::default()))
         .single_loader(|key: String| async move { Ok(Some(key)) }.boxed())
         .max_batch_size(0)
         .build();
-    assert_eq!(
-        invalid_batch_size.err().unwrap().to_string(),
-        "max_batch_size must be greater than zero"
-    );
+    assert!(matches!(
+        invalid_batch_size.err().unwrap(),
+        Error::Configuration(ConfigurationError::InvalidMaxBatchSize)
+    ));
 
     let invalid_async_write_limit = StringAutoCache::builder()
         .cache(LocalCache::new(LocalCacheOption::default()))
         .single_loader(|key: String| async move { Ok(Some(key)) }.boxed())
         .max_concurrent_async_cache_writes(0)
         .build();
-    assert_eq!(
-        invalid_async_write_limit.err().unwrap().to_string(),
-        "max_concurrent_async_cache_writes must be greater than zero"
-    );
+    assert!(matches!(
+        invalid_async_write_limit.err().unwrap(),
+        Error::Configuration(ConfigurationError::InvalidMaxConcurrentAsyncCacheWrites)
+    ));
 
     let invalid_refresh_queue_capacity = StringAutoCache::builder()
         .cache(LocalCache::new(LocalCacheOption::default()))
         .single_loader(|key: String| async move { Ok(Some(key)) }.boxed())
         .async_refresh_queue_capacity(0)
         .build();
-    assert_eq!(
-        invalid_refresh_queue_capacity.err().unwrap().to_string(),
-        "async_refresh_queue_capacity must be greater than zero"
-    );
+    assert!(matches!(
+        invalid_refresh_queue_capacity.err().unwrap(),
+        Error::Configuration(ConfigurationError::InvalidAsyncRefreshQueueCapacity)
+    ));
 
     let missing_runtime = StringAutoCache::builder()
         .cache(LocalCache::new(LocalCacheOption::default()))
         .single_loader(|key: String| async move { Ok(Some(key)) }.boxed())
         .use_expired_data(true)
         .build();
-    assert_eq!(
-        missing_runtime.err().unwrap().to_string(),
-        "a Tokio runtime is required for background tasks"
-    );
+    assert!(matches!(
+        missing_runtime.err().unwrap(),
+        Error::RuntimeUnavailable
+    ));
 }

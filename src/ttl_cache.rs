@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::Result as AnyResult;
 use arc_swap::ArcSwapOption;
 use chrono::prelude::*;
 use futures::future::BoxFuture;
 
-use crate::{cache::Cache, entry::EntryTrait, error::AutoCacheError};
+use crate::{cache::Cache, entry::EntryTrait, ConfigurationError, Error, Result};
 
 type ExpireListener<K, V> = Box<dyn Fn(Vec<(K, V)>) -> BoxFuture<'static, ()> + Send + Sync>;
 
@@ -71,7 +71,7 @@ impl<K, V> TtlCache<K, V> {
     ) -> Result<()> {
         let cleanup_worker = self.cleanup_worker.lock();
         if cleanup_worker.is_some() {
-            bail!("expire listener already set");
+            return Err(ConfigurationError::ExpireListenerAlreadySet.into());
         }
 
         self.expire_listener
@@ -100,7 +100,7 @@ where
     type Key = K;
     type Value = V;
 
-    async fn mget(&self, keys: &[Self::Key]) -> Result<Vec<Self::Value>> {
+    async fn mget(&self, keys: &[Self::Key]) -> AnyResult<Vec<Self::Value>> {
         if self.ttl.is_none() {
             let data = self.data.read();
             return Ok(keys
@@ -123,7 +123,7 @@ where
             .collect())
     }
 
-    async fn mset(&self, kvs: &[(Self::Key, Self::Value)]) -> Result<()> {
+    async fn mset(&self, kvs: &[(Self::Key, Self::Value)]) -> AnyResult<()> {
         let time_to_remove_ms = self
             .ttl
             .map(|ttl| {
@@ -149,7 +149,7 @@ where
         Ok(())
     }
 
-    async fn mdel(&self, keys: &[Self::Key]) -> Result<()> {
+    async fn mdel(&self, keys: &[Self::Key]) -> AnyResult<()> {
         let mut data = self.data.write();
         keys.iter().for_each(|key| {
             data.remove(key);
@@ -219,8 +219,8 @@ where
             return Ok(());
         }
 
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|_| AutoCacheError::RuntimeUnavailable)?;
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|_| Error::RuntimeUnavailable)?;
         let listener = self.expire_listener.load_full();
 
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
