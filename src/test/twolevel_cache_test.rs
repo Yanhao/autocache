@@ -18,9 +18,9 @@ struct TestCache {
 
 impl Cache for TestCache {
     type Key = String;
-    type Value = TestEntry;
+    type Value = String;
 
-    async fn mget(&self, keys: &[Self::Key]) -> anyhow::Result<Vec<Self::Value>> {
+    async fn mget(&self, keys: &[Self::Key]) -> anyhow::Result<Vec<TestEntry>> {
         self.get_calls.lock().push(keys.to_vec());
         if let Some(error) = *self.get_error.lock() {
             anyhow::bail!(error);
@@ -33,14 +33,14 @@ impl Cache for TestCache {
             .collect())
     }
 
-    async fn mset(&self, kvs: &[(Self::Key, Self::Value)]) -> anyhow::Result<()> {
+    async fn mset(&self, entries: &[TestEntry]) -> anyhow::Result<()> {
         if let Some(error) = *self.set_error.lock() {
             anyhow::bail!(error);
         }
 
         let mut data = self.data.lock();
-        for (key, value) in kvs {
-            data.insert(key.clone(), value.clone());
+        for entry in entries {
+            data.insert(entry.key.clone(), entry.clone());
         }
         Ok(())
     }
@@ -78,7 +78,7 @@ fn expired_entry(key: &str, value: &str) -> TestEntry {
     }
 }
 
-fn unavailable_two_level_cache() -> TwoLevelCache<String, TestEntry, TestCache, TestCache> {
+fn unavailable_two_level_cache() -> TwoLevelCache<TestCache, TestCache> {
     let l2 = TestCache::default();
     *l2.get_error.lock() = Some("L2 read unavailable");
     *l2.set_error.lock() = Some("L2 write unavailable");
@@ -89,14 +89,10 @@ fn unavailable_two_level_cache() -> TwoLevelCache<String, TestEntry, TestCache, 
 #[tokio::test]
 async fn test_mget_loads_only_l1_misses_from_l2_and_warms_l1() {
     let l1 = TestCache::default();
-    l1.mset(&[("l1-key".to_string(), entry("l1-key", "l1-value"))])
-        .await
-        .unwrap();
+    l1.mset(&[entry("l1-key", "l1-value")]).await.unwrap();
 
     let l2 = TestCache::default();
-    l2.mset(&[("l2-key".to_string(), entry("l2-key", "l2-value"))])
-        .await
-        .unwrap();
+    l2.mset(&[entry("l2-key", "l2-value")]).await.unwrap();
 
     let l2_observer = l2.clone();
     let cache = TwoLevelCache::new(l1, l2);
@@ -125,9 +121,7 @@ async fn test_mget_returns_l2_entries_when_l1_warm_fails() {
     *l1.set_error.lock() = Some("L1 write unavailable");
 
     let l2 = TestCache::default();
-    l2.mset(&[("test-key".to_string(), entry("test-key", "l2-value"))])
-        .await
-        .unwrap();
+    l2.mset(&[entry("test-key", "l2-value")]).await.unwrap();
     let cache = TwoLevelCache::new(l1, l2);
 
     let entries = cache.mget(&["test-key".to_string()]).await.unwrap();
@@ -139,17 +133,12 @@ async fn test_mget_returns_l2_entries_when_l1_warm_fails() {
 #[tokio::test]
 async fn test_mget_prefers_l2_when_l1_entry_is_expired() {
     let l1 = TestCache::default();
-    l1.mset(&[(
-        "test-key".to_string(),
-        expired_entry("test-key", "stale-value"),
-    )])
-    .await
-    .unwrap();
-
-    let l2 = TestCache::default();
-    l2.mset(&[("test-key".to_string(), entry("test-key", "fresh-value"))])
+    l1.mset(&[expired_entry("test-key", "stale-value")])
         .await
         .unwrap();
+
+    let l2 = TestCache::default();
+    l2.mset(&[entry("test-key", "fresh-value")]).await.unwrap();
 
     let l2_observer = l2.clone();
     let cache = TwoLevelCache::new(l1, l2);
@@ -172,12 +161,9 @@ async fn test_mget_prefers_l2_when_l1_entry_is_expired() {
 #[tokio::test]
 async fn test_mget_preserves_expired_l1_entry_when_l2_misses() {
     let l1 = TestCache::default();
-    l1.mset(&[(
-        "test-key".to_string(),
-        expired_entry("test-key", "stale-value"),
-    )])
-    .await
-    .unwrap();
+    l1.mset(&[expired_entry("test-key", "stale-value")])
+        .await
+        .unwrap();
 
     let l2 = TestCache::default();
     let cache = TwoLevelCache::new(l1, l2);
@@ -190,12 +176,9 @@ async fn test_mget_preserves_expired_l1_entry_when_l2_misses() {
 #[tokio::test]
 async fn test_mget_preserves_expired_l1_entry_when_l2_fails() {
     let l1 = TestCache::default();
-    l1.mset(&[(
-        "test-key".to_string(),
-        expired_entry("test-key", "stale-value"),
-    )])
-    .await
-    .unwrap();
+    l1.mset(&[expired_entry("test-key", "stale-value")])
+        .await
+        .unwrap();
 
     let l2 = TestCache::default();
     *l2.get_error.lock() = Some("L2 unavailable");
@@ -211,15 +194,11 @@ async fn test_mget_preserves_expired_l1_entry_when_l2_fails() {
 async fn test_mdel_invalidates_l1_when_l2_fails() {
     let key = "test-key".to_string();
     let l1 = TestCache::default();
-    l1.mset(&[(key.clone(), entry(&key, "l1-value"))])
-        .await
-        .unwrap();
+    l1.mset(&[entry(&key, "l1-value")]).await.unwrap();
     let l1_observer = l1.clone();
 
     let l2 = TestCache::default();
-    l2.mset(&[(key.clone(), entry(&key, "l2-value"))])
-        .await
-        .unwrap();
+    l2.mset(&[entry(&key, "l2-value")]).await.unwrap();
     *l2.del_error.lock() = Some("L2 unavailable");
     let l2_observer = l2.clone();
     let cache = TwoLevelCache::new(l1, l2);
@@ -280,9 +259,7 @@ async fn test_multi_loader_returns_source_values_when_cache_fill_fails() {
 async fn test_not_found_returns_success_when_cache_invalidation_fails() {
     let key = "test-key".to_string();
     let l1 = TestCache::default();
-    l1.mset(&[(key.clone(), entry(&key, "stale-value"))])
-        .await
-        .unwrap();
+    l1.mset(&[entry(&key, "stale-value")]).await.unwrap();
     *l1.del_error.lock() = Some("L1 delete unavailable");
     let l1_observer = l1.clone();
 

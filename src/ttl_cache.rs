@@ -5,9 +5,9 @@ use arc_swap::ArcSwapOption;
 use chrono::prelude::*;
 use futures::future::BoxFuture;
 
-use crate::{cache::Cache, entry::EntryTrait, ConfigurationError, Error, Result};
+use crate::{cache::Cache, ConfigurationError, Entry, Error, Result};
 
-type ExpireListener<K, V> = Box<dyn Fn(Vec<(K, V)>) -> BoxFuture<'static, ()> + Send + Sync>;
+type ExpireListener<K, V> = Box<dyn Fn(Vec<Entry<K, V>>) -> BoxFuture<'static, ()> + Send + Sync>;
 
 struct CleanupWorker {
     task: tokio::task::JoinHandle<()>,
@@ -25,6 +25,8 @@ struct CacheItem<V> {
     value: V,
 }
 
+type CacheData<K, V> = Arc<parking_lot::RwLock<im::OrdMap<K, CacheItem<Entry<K, V>>>>>;
+
 impl<V> CacheItem<V> {
     fn need_to_remove(&self) -> bool {
         self.time_to_remove_ms
@@ -33,7 +35,7 @@ impl<V> CacheItem<V> {
 }
 
 pub struct TtlCache<K, V> {
-    data: Arc<parking_lot::RwLock<im::OrdMap<K, CacheItem<V>>>>,
+    data: CacheData<K, V>,
 
     ttl: Option<std::time::Duration>,
     expire_listener: ArcSwapOption<ExpireListener<K, V>>,
@@ -54,7 +56,7 @@ impl<K, V> TtlCache<K, V> {
 
     pub fn new_with_expire_listener(
         ttl: Option<std::time::Duration>,
-        listener: impl Fn(Vec<(K, V)>) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+        listener: impl Fn(Vec<Entry<K, V>>) -> BoxFuture<'static, ()> + Send + Sync + 'static,
     ) -> Self {
         Self {
             data: Arc::new(parking_lot::RwLock::new(im::OrdMap::new())),
@@ -67,7 +69,7 @@ impl<K, V> TtlCache<K, V> {
 
     pub fn set_expire_listener(
         &self,
-        listener: impl Fn(Vec<(K, V)>) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+        listener: impl Fn(Vec<Entry<K, V>>) -> BoxFuture<'static, ()> + Send + Sync + 'static,
     ) -> Result<()> {
         let cleanup_worker = self.cleanup_worker.lock();
         if cleanup_worker.is_some() {
@@ -100,7 +102,7 @@ where
     type Key = K;
     type Value = V;
 
-    async fn mget(&self, keys: &[Self::Key]) -> AnyResult<Vec<Self::Value>> {
+    async fn mget(&self, keys: &[Self::Key]) -> AnyResult<Vec<Entry<Self::Key, Self::Value>>> {
         if self.ttl.is_none() {
             let data = self.data.read();
             return Ok(keys
@@ -123,7 +125,7 @@ where
             .collect())
     }
 
-    async fn mset(&self, kvs: &[(Self::Key, Self::Value)]) -> AnyResult<()> {
+    async fn mset(&self, entries: &[Entry<Self::Key, Self::Value>]) -> AnyResult<()> {
         let time_to_remove_ms = self
             .ttl
             .map(|ttl| {
@@ -136,12 +138,12 @@ where
             .transpose()?;
 
         let mut data = self.data.write();
-        for kv in kvs {
+        for entry in entries {
             data.insert(
-                kv.0.clone(),
+                entry.key.clone(),
                 CacheItem {
                     time_to_remove_ms,
-                    value: kv.1.clone(),
+                    value: entry.clone(),
                 },
             );
         }
@@ -166,19 +168,16 @@ where
 impl<K, V> TtlCache<K, V>
 where
     K: Ord + Sync + Send + Clone + 'static,
-    V: Clone + Sync + Send + EntryTrait<K> + 'static,
+    V: Clone + Sync + Send + 'static,
 {
-    async fn check_expires(
-        cache: Arc<parking_lot::RwLock<im::OrdMap<K, CacheItem<V>>>>,
-        expire_listener: Arc<ExpireListener<K, V>>,
-    ) {
+    async fn check_expires(cache: CacheData<K, V>, expire_listener: Arc<ExpireListener<K, V>>) {
         let cache_snap = cache.read().clone();
 
         let mut expires = Vec::with_capacity(128);
 
-        for (key, ci) in cache_snap.iter() {
+        for ci in cache_snap.values() {
             if ci.value.is_expired() {
-                expires.push((key.clone(), ci.value.clone()));
+                expires.push(ci.value.clone());
 
                 if expires.len() == 100 {
                     expire_listener(expires.clone()).await;
@@ -192,7 +191,7 @@ where
         }
     }
 
-    fn cleanup_ttl(cache: Arc<parking_lot::RwLock<im::OrdMap<K, CacheItem<V>>>>) {
+    fn cleanup_ttl(cache: CacheData<K, V>) {
         let mut cache = cache.write();
         let keys_to_remove = cache
             .iter()

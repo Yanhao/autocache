@@ -27,9 +27,7 @@ pub use builder::AutoCacheBuilder;
 pub use cache::Cache;
 #[cfg(feature = "serialize")]
 pub use codec::Codec;
-#[cfg(feature = "serialize")]
-pub use entry::SerializableEntryTrait;
-pub use entry::{Entry, EntryTrait};
+pub use entry::Entry;
 pub use error::{
     CacheOperation, ConfigurationError, Error, ErrorSource, LoaderKind, Result,
     SerializationOperation,

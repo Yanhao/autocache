@@ -16,40 +16,20 @@ pub struct Entry<K, V> {
     pub expire_at_ms: Option<i64>,
 }
 
-pub trait EntryTrait<K> {
-    fn get_key(&self) -> K;
-    fn is_expired(&self) -> bool;
-}
-
-impl<K, V> EntryTrait<K> for Entry<K, V>
-where
-    K: Clone,
-{
-    fn is_expired(&self) -> bool {
+impl<K, V> Entry<K, V> {
+    pub fn is_expired(&self) -> bool {
         self.expire_at_ms
             .is_some_and(|expire_at_ms| expire_at_ms < Utc::now().timestamp_millis())
     }
-
-    fn get_key(&self) -> K {
-        self.key.clone()
-    }
 }
 
 #[cfg(feature = "serialize")]
-pub trait SerializableEntryTrait {
-    fn decode(data: bytes::Bytes) -> Result<Self>
-    where
-        Self: Sized;
-    fn encode(&self) -> Result<bytes::Bytes>;
-}
-
-#[cfg(feature = "serialize")]
-impl<K, V> SerializableEntryTrait for Entry<K, V>
+impl<K, V> Entry<K, V>
 where
     K: Serialize + DeserializeOwned + Clone,
     V: Codec,
 {
-    fn decode(data: bytes::Bytes) -> Result<Self> {
+    pub(crate) fn decode(data: bytes::Bytes) -> Result<Self> {
         let eni: EntryInner<K> = serde_json::from_reader(data.reader()).map_err(|error| {
             Error::serialization(SerializationOperation::Decode, "entry-json", error)
         })?;
@@ -70,7 +50,7 @@ where
         })
     }
 
-    fn encode(&self) -> Result<bytes::Bytes> {
+    pub(crate) fn encode(&self) -> Result<bytes::Bytes> {
         let value_data = self
             .value
             .as_ref()
@@ -108,7 +88,7 @@ mod tests {
     use bytes::Bytes;
     use serde::{Deserialize, Serialize};
 
-    use super::{Entry, SerializableEntryTrait};
+    use super::Entry;
     use crate::{Codec, Error, SerializationOperation};
 
     #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

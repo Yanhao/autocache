@@ -6,13 +6,8 @@ use futures::future::BoxFuture;
 use tracing::{debug, error, warn};
 
 use crate::{
-    builder::AutoCacheBuilder,
-    cache::Cache,
-    entry::{Entry, EntryTrait},
-    error::ConfigurationError,
-    loader::Loader,
-    singleflight::Group,
-    CacheOperation, Error, LoaderKind, Options, Result,
+    builder::AutoCacheBuilder, cache::Cache, entry::Entry, error::ConfigurationError,
+    loader::Loader, singleflight::Group, CacheOperation, Error, LoaderKind, Options, Result,
 };
 
 pub(crate) type MetricsCallback =
@@ -48,7 +43,7 @@ struct SourceLoadContext<K, V, C, E>
 where
     K: Clone + Eq + Hash,
     V: Clone,
-    C: Cache<Key = K, Value = Entry<K, V>>,
+    C: Cache<Key = K, Value = V>,
 {
     loader: Arc<Loader<K, V, E>>,
     cache: Arc<C>,
@@ -62,7 +57,7 @@ impl<K, V, C, E> Clone for SourceLoadContext<K, V, C, E>
 where
     K: Clone + Eq + Hash,
     V: Clone,
-    C: Cache<Key = K, Value = Entry<K, V>>,
+    C: Cache<Key = K, Value = V>,
 {
     fn clone(&self) -> Self {
         Self {
@@ -80,7 +75,7 @@ pub struct AutoCache<K, V, C, E = ()>
 where
     K: Clone + Eq + Hash,
     V: Clone,
-    C: Cache<Key = K, Value = Entry<K, V>>,
+    C: Cache<Key = K, Value = V>,
 {
     pub(crate) cache_store: Arc<C>,
     pub(crate) loader: Arc<Loader<K, V, E>>,
@@ -112,7 +107,7 @@ impl<K, V, C, E> AutoCache<K, V, C, E>
 where
     K: Clone + Debug + Eq + Hash + Sync + Send + 'static,
     V: Clone + Debug + Sync + Send + 'static,
-    C: Cache<Key = K, Value = Entry<K, V>> + Sync + Send + 'static,
+    C: Cache<Key = K, Value = V> + Sync + Send + 'static,
     E: Clone + Sync + Send + 'static,
 {
     pub fn builder() -> AutoCacheBuilder<K, V, C, E> {
@@ -243,7 +238,7 @@ where
 
     async fn write_cache_entries(
         cache: Arc<C>,
-        entries: Vec<(K, Entry<K, V>)>,
+        entries: Vec<Entry<K, V>>,
         metrics: Option<MetricsContext>,
     ) {
         if let Err(error) = cache.mset(&entries).await {
@@ -254,11 +249,7 @@ where
         }
     }
 
-    async fn set_cache_entries(
-        cache: Arc<C>,
-        entries: Vec<(K, Entry<K, V>)>,
-        config: CacheFillConfig,
-    ) {
+    async fn set_cache_entries(cache: Arc<C>, entries: Vec<Entry<K, V>>, config: CacheFillConfig) {
         if config.asynchronous {
             match tokio::runtime::Handle::try_current() {
                 Ok(runtime) => {
@@ -371,7 +362,7 @@ where
                     );
                     Self::set_cache_entries(
                         loader_cache,
-                        vec![(loader_key.clone(), entry.clone())],
+                        vec![entry.clone()],
                         loader_cache_fill_config,
                     )
                     .await;
@@ -412,28 +403,22 @@ where
             let kvs = (mloader)(loader_keys.clone())
                 .await
                 .map_err(|error| Error::loader(LoaderKind::Batch, error))?;
-            let mut key_entries = Vec::with_capacity(loader_keys.len());
+            let mut entries = Vec::with_capacity(loader_keys.len());
             let mut missing_keys = Vec::new();
 
             for key in &loader_keys {
                 if let Some((loaded_key, value)) = kvs.iter().find(|kv| kv.0 == key.0) {
-                    key_entries.push((
-                        loaded_key.clone(),
-                        Entry {
-                            key: loaded_key.clone(),
-                            value: Some(value.clone()),
-                            expire_at_ms: Some(Self::expiration_timestamp(expire_time)?),
-                        },
-                    ));
+                    entries.push(Entry {
+                        key: loaded_key.clone(),
+                        value: Some(value.clone()),
+                        expire_at_ms: Some(Self::expiration_timestamp(expire_time)?),
+                    });
                 } else if cache_none {
-                    key_entries.push((
-                        key.0.clone(),
-                        Entry {
-                            key: key.0.clone(),
-                            value: None,
-                            expire_at_ms: Some(Self::expiration_timestamp(none_value_expire_time)?),
-                        },
-                    ));
+                    entries.push(Entry {
+                        key: key.0.clone(),
+                        value: None,
+                        expire_at_ms: Some(Self::expiration_timestamp(none_value_expire_time)?),
+                    });
                 } else {
                     missing_keys.push(key.0.clone());
                 }
@@ -448,11 +433,11 @@ where
                 .await;
             }
 
-            if !key_entries.is_empty() {
-                Self::set_cache_entries(cache, key_entries.clone(), cache_fill_config).await;
+            if !entries.is_empty() {
+                Self::set_cache_entries(cache, entries.clone(), cache_fill_config).await;
             }
 
-            Ok(key_entries.into_iter().map(|(_, entry)| entry).collect())
+            Ok(entries)
         })
         .await
     }
@@ -739,21 +724,18 @@ where
             return Ok(());
         }
 
-        let kvs = kvs
+        let entries = kvs
             .iter()
             .map(|kv| {
-                Ok((
-                    kv.0.clone(),
-                    Entry {
-                        key: kv.0.clone(),
-                        value: Some(kv.1.clone()),
-                        expire_at_ms: Some(Self::expiration_timestamp(self.expire_time)?),
-                    },
-                ))
+                Ok(Entry {
+                    key: kv.0.clone(),
+                    value: Some(kv.1.clone()),
+                    expire_at_ms: Some(Self::expiration_timestamp(self.expire_time)?),
+                })
             })
             .collect::<Result<Vec<_>>>()?;
 
-        self.cache_store.mset(&kvs).await.map_err(|error| {
+        self.cache_store.mset(&entries).await.map_err(|error| {
             Error::from_cache(CacheOperation::Write, self.cache_store.name(), error)
         })?;
 
@@ -864,7 +846,7 @@ impl<K, V, C> AutoCache<K, V, C, ()>
 where
     K: Clone + Debug + Eq + Hash + Sync + Send + 'static,
     V: Clone + Debug + Sync + Send + 'static,
-    C: Cache<Key = K, Value = Entry<K, V>> + Sync + Send + 'static,
+    C: Cache<Key = K, Value = V> + Sync + Send + 'static,
 {
     /// Returns the value associated with a single key.
     pub async fn get(&self, key: &K) -> Result<Option<V>> {
@@ -909,7 +891,7 @@ impl<K, V, C, E> Drop for AutoCache<K, V, C, E>
 where
     K: Clone + Eq + Hash,
     V: Clone,
-    C: Cache<Key = K, Value = Entry<K, V>>,
+    C: Cache<Key = K, Value = V>,
 {
     fn drop(&mut self) {
         self.stop();
@@ -920,7 +902,7 @@ impl<K, V, C, E> AutoCache<K, V, C, E>
 where
     K: Clone + Eq + Hash,
     V: Clone,
-    C: Cache<Key = K, Value = Entry<K, V>>,
+    C: Cache<Key = K, Value = V>,
 {
     fn stop(&self) {
         if let Some(s) = self.stop_ch.as_ref() {

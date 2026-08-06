@@ -389,7 +389,7 @@ use autocache::{
     local_cache::{LocalCache, LocalCacheOption},
     redis_cache::RedisCache,
     twolevel_cache::TwoLevelCache,
-    Codec, Entry,
+    Codec,
 };
 use serde::{Deserialize, Serialize};
 
@@ -399,9 +399,9 @@ struct Value(String);
 impl Codec for Value {}
 
 fn example(client: redis::Client) {
-let l1 = LocalCache::<String, Entry<String, Value>>::new(LocalCacheOption::default());
-let l2 = RedisCache::<String, Entry<String, Value>>::new(client);
-let backend = TwoLevelCache::<String, Entry<String, Value>, _, _>::new(l1, l2);
+let l1 = LocalCache::<String, Value>::new(LocalCacheOption::default());
+let l2 = RedisCache::<String, Value>::new(client);
+let backend = TwoLevelCache::new(l1, l2);
 let _ = backend;
 }
 # }

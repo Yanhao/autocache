@@ -5,10 +5,10 @@ use derivative::Derivative;
 use moka::sync::SegmentedCache;
 use tracing::{debug, warn};
 
-use crate::cache::Cache;
+use crate::{cache::Cache, Entry};
 
 pub struct LocalCache<K, V> {
-    data: SegmentedCache<K, V>,
+    data: SegmentedCache<K, Entry<K, V>>,
 }
 
 #[derive(Derivative)]
@@ -51,7 +51,7 @@ where
     type Key = K;
     type Value = V;
 
-    async fn mget(&self, keys: &[Self::Key]) -> Result<Vec<Self::Value>> {
+    async fn mget(&self, keys: &[Self::Key]) -> Result<Vec<Entry<Self::Key, Self::Value>>> {
         debug!("autocache: localcache: mget keys: {keys:?}");
 
         Ok(keys
@@ -60,14 +60,14 @@ where
             .collect::<Vec<_>>())
     }
 
-    async fn mset(&self, kvs: &[(Self::Key, Self::Value)]) -> Result<()> {
+    async fn mset(&self, entries: &[Entry<Self::Key, Self::Value>]) -> Result<()> {
         debug!(
             "autocache: localcache: mset keys: {:?}",
-            kvs.iter().map(|(k, _)| k).collect::<Vec<_>>()
+            entries.iter().map(|entry| &entry.key).collect::<Vec<_>>()
         );
 
-        for kv in kvs {
-            self.data.insert(kv.0.clone(), kv.1.clone());
+        for entry in entries {
+            self.data.insert(entry.key.clone(), entry.clone());
         }
 
         Ok(())

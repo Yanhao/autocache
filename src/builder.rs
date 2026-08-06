@@ -8,7 +8,6 @@ use anyhow::Result as AnyResult;
 use crate::{
     autocache::{AutoCache, MetricsCallback},
     cache::Cache,
-    entry::Entry,
     error::ConfigurationError,
     loader::Loader,
     singleflight::Group,
@@ -22,7 +21,7 @@ pub struct AutoCacheBuilder<K, V, C, E = ()>
 where
     K: Clone,
     V: Clone,
-    C: Cache<Key = K, Value = Entry<K, V>>,
+    C: Cache<Key = K, Value = V>,
 {
     pub(crate) cache: Option<C>,
     pub(crate) loader: Option<Loader<K, V, E>>,
@@ -47,7 +46,7 @@ impl<K, V, C, E> Default for AutoCacheBuilder<K, V, C, E>
 where
     K: Clone + Debug + Eq + Hash + Sync + Send + 'static,
     V: Clone + Debug + Sync + Send + 'static,
-    C: Cache<Key = K, Value = Entry<K, V>> + Sync + Send + 'static,
+    C: Cache<Key = K, Value = V> + Sync + Send + 'static,
     E: Clone + Sync + Send + 'static,
 {
     fn default() -> Self {
@@ -59,7 +58,7 @@ impl<K, V, C, E> AutoCacheBuilder<K, V, C, E>
 where
     K: Clone + Debug + Eq + Hash + Sync + Send + 'static,
     V: Clone + Debug + Sync + Send + 'static,
-    C: Cache<Key = K, Value = Entry<K, V>> + Sync + Send + 'static,
+    C: Cache<Key = K, Value = V> + Sync + Send + 'static,
     E: Clone + Sync + Send + 'static,
 {
     pub fn new() -> Self {
@@ -276,7 +275,7 @@ impl<K, V, C> AutoCacheBuilder<K, V, C, ()>
 where
     K: Clone + Debug + Eq + Hash + Sync + Send + 'static,
     V: Clone + Debug + Sync + Send + 'static,
-    C: Cache<Key = K, Value = Entry<K, V>> + Sync + Send + 'static,
+    C: Cache<Key = K, Value = V> + Sync + Send + 'static,
 {
     /// Sets a loader for individual cache keys.
     ///

@@ -2,44 +2,38 @@ use std::collections::BTreeSet;
 
 use tracing::warn;
 
-use crate::{cache::Cache, entry::EntryTrait};
+use crate::{cache::Cache, Entry};
 
-pub struct TwoLevelCache<K, V, L1, L2> {
+pub struct TwoLevelCache<L1, L2> {
     local_cache: L1,
     redis_cache: L2,
-
-    _m1: std::marker::PhantomData<K>,
-    _m2: std::marker::PhantomData<V>,
 }
 
-impl<K, V, L1, L2> TwoLevelCache<K, V, L1, L2> {
+impl<L1, L2> TwoLevelCache<L1, L2> {
     pub fn new(l1: L1, l2: L2) -> Self {
         Self {
             local_cache: l1,
             redis_cache: l2,
-
-            _m1: std::marker::PhantomData,
-            _m2: std::marker::PhantomData,
         }
     }
 }
 
-impl<K, V, L1, L2> Cache for TwoLevelCache<K, V, L1, L2>
+impl<L1, L2> Cache for TwoLevelCache<L1, L2>
 where
-    K: Clone + Ord + Send + Sync,
-    V: Clone + Send + Sync + EntryTrait<K>,
-    L1: Cache<Key = K, Value = V> + Sync,
-    L2: Cache<Key = K, Value = V> + Sync,
+    L1: Cache + Sync,
+    L2: Cache<Key = L1::Key, Value = L1::Value> + Sync,
+    L1::Key: Clone + Ord + Send + Sync,
+    L1::Value: Clone + Send + Sync,
 {
-    type Key = K;
-    type Value = V;
+    type Key = L1::Key;
+    type Value = L1::Value;
 
-    async fn mget(&self, keys: &[Self::Key]) -> anyhow::Result<Vec<Self::Value>> {
+    async fn mget(&self, keys: &[Self::Key]) -> anyhow::Result<Vec<Entry<Self::Key, Self::Value>>> {
         let mut l1_entries = self.local_cache.mget(keys).await?;
         let l1_hit_keys = l1_entries
             .iter()
             .filter(|entry| !entry.is_expired())
-            .map(EntryTrait::get_key)
+            .map(|entry| entry.key.clone())
             .collect::<BTreeSet<_>>();
         let l1_missed_keys = keys
             .iter()
@@ -68,7 +62,6 @@ where
             .iter()
             .filter(|entry| !entry.is_expired())
             .cloned()
-            .map(|entry| (entry.get_key(), entry))
             .collect::<Vec<_>>();
         if !fresh_l2_entries.is_empty() {
             let _ = self
@@ -87,18 +80,18 @@ where
 
         let l2_hit_keys = l2_entries
             .iter()
-            .map(EntryTrait::get_key)
+            .map(|entry| entry.key.clone())
             .collect::<BTreeSet<_>>();
-        l1_entries.retain(|entry| !entry.is_expired() || !l2_hit_keys.contains(&entry.get_key()));
+        l1_entries.retain(|entry| !entry.is_expired() || !l2_hit_keys.contains(&entry.key));
 
         l1_entries.append(&mut l2_entries);
 
         Ok(l1_entries)
     }
 
-    async fn mset(&self, kvs: &[(Self::Key, Self::Value)]) -> anyhow::Result<()> {
-        self.redis_cache.mset(kvs).await?;
-        self.local_cache.mset(kvs).await?;
+    async fn mset(&self, entries: &[Entry<Self::Key, Self::Value>]) -> anyhow::Result<()> {
+        self.redis_cache.mset(entries).await?;
+        self.local_cache.mset(entries).await?;
 
         Ok(())
     }

@@ -8,7 +8,7 @@ use futures::FutureExt;
 use crate::{
     autocache::AutoCache,
     local_cache::{LocalCache, LocalCacheOption},
-    Cache, CacheOperation, ConfigurationError, Entry, EntryTrait, Error, LoaderKind, Options,
+    Cache, CacheOperation, ConfigurationError, Entry, Error, LoaderKind, Options,
 };
 
 fn on_metrics(_method: &str, _is_error: bool, _ns: &str, _from: &str, _cache_name: &str) {}
@@ -115,13 +115,16 @@ impl BlockingWriteCache {
 
 impl Cache for BlockingWriteCache {
     type Key = String;
-    type Value = Entry<String, String>;
+    type Value = String;
 
-    async fn mget(&self, _keys: &[Self::Key]) -> anyhow::Result<Vec<Self::Value>> {
+    async fn mget(
+        &self,
+        _keys: &[Self::Key],
+    ) -> anyhow::Result<Vec<Entry<Self::Key, Self::Value>>> {
         Ok(Vec::new())
     }
 
-    async fn mset(&self, _kvs: &[(Self::Key, Self::Value)]) -> anyhow::Result<()> {
+    async fn mset(&self, _entries: &[Entry<Self::Key, Self::Value>]) -> anyhow::Result<()> {
         self.started.fetch_add(1, Ordering::SeqCst);
         self.release.acquire().await?.forget();
         self.completed.fetch_add(1, Ordering::SeqCst);
@@ -142,13 +145,16 @@ struct FailingDeleteCache;
 
 impl Cache for FailingDeleteCache {
     type Key = String;
-    type Value = Entry<String, String>;
+    type Value = String;
 
-    async fn mget(&self, _keys: &[Self::Key]) -> anyhow::Result<Vec<Self::Value>> {
+    async fn mget(
+        &self,
+        _keys: &[Self::Key],
+    ) -> anyhow::Result<Vec<Entry<Self::Key, Self::Value>>> {
         Ok(Vec::new())
     }
 
-    async fn mset(&self, _kvs: &[(Self::Key, Self::Value)]) -> anyhow::Result<()> {
+    async fn mset(&self, _entries: &[Entry<Self::Key, Self::Value>]) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -166,13 +172,16 @@ struct FailingReadCache;
 
 impl Cache for FailingReadCache {
     type Key = String;
-    type Value = Entry<String, String>;
+    type Value = String;
 
-    async fn mget(&self, _keys: &[Self::Key]) -> anyhow::Result<Vec<Self::Value>> {
+    async fn mget(
+        &self,
+        _keys: &[Self::Key],
+    ) -> anyhow::Result<Vec<Entry<Self::Key, Self::Value>>> {
         anyhow::bail!("cache read failed")
     }
 
-    async fn mset(&self, _kvs: &[(Self::Key, Self::Value)]) -> anyhow::Result<()> {
+    async fn mset(&self, _entries: &[Entry<Self::Key, Self::Value>]) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -702,14 +711,17 @@ async fn test_local_cache_zero_segments_uses_one_segment() {
     let key = "test-key".to_string();
 
     cache
-        .mset(&[(key.clone(), "test-value".to_string())])
+        .mset(&[Entry {
+            key: key.clone(),
+            value: Some("test-value".to_string()),
+            expire_at_ms: None,
+        }])
         .await
         .unwrap();
 
-    assert_eq!(
-        cache.mget(&[key]).await.unwrap(),
-        vec!["test-value".to_string()]
-    );
+    let entries = cache.mget(&[key]).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].value.as_deref(), Some("test-value"));
 }
 
 #[test]
@@ -1067,7 +1079,7 @@ async fn test_multi_loader_batch_identity_does_not_use_delimited_strings() {
 
 #[test]
 fn test_builder_returns_errors_instead_of_panicking_for_invalid_configuration() {
-    type StringCache = LocalCache<String, Entry<String, String>>;
+    type StringCache = LocalCache<String, String>;
     type StringAutoCache = AutoCache<String, String, StringCache>;
 
     let missing_cache = StringAutoCache::builder()

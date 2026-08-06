@@ -4,8 +4,9 @@ use anyhow::Result;
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use redis::AsyncCommands;
+use serde::{de::DeserializeOwned, Serialize};
 
-use crate::{cache::Cache, SerializableEntryTrait};
+use crate::{cache::Cache, Codec, Entry};
 
 pub struct RedisCache<K, V> {
     namespace: ArcSwapOption<String>,
@@ -13,8 +14,7 @@ pub struct RedisCache<K, V> {
     ttl_sec: usize,
     redis_cli: redis::Client,
 
-    _m1: std::marker::PhantomData<K>,
-    _m2: std::marker::PhantomData<V>,
+    _marker: std::marker::PhantomData<fn() -> (K, V)>,
 }
 
 impl<K, V> RedisCache<K, V> {
@@ -27,8 +27,7 @@ impl<K, V> RedisCache<K, V> {
             ttl_sec,
 
             redis_cli: cli,
-            _m1: std::marker::PhantomData,
-            _m2: std::marker::PhantomData,
+            _marker: std::marker::PhantomData,
         }
     }
 }
@@ -37,7 +36,7 @@ impl<K, V> RedisCache<K, V>
 where
     K: Sync + AsRef<str>,
 {
-    fn generate_redis_key(&self, k: K) -> String {
+    fn generate_redis_key(&self, k: &K) -> String {
         if let Some(ns) = self.namespace.load().as_ref() {
             if ns.is_empty() {
                 return k.as_ref().to_string();
@@ -58,13 +57,13 @@ where
 
 impl<K, V> Cache for RedisCache<K, V>
 where
-    K: Clone + Sync + AsRef<str>,
-    V: Sync + SerializableEntryTrait,
+    K: Clone + Sync + AsRef<str> + Serialize + DeserializeOwned,
+    V: Sync + Codec,
 {
     type Key = K;
     type Value = V;
 
-    async fn mget(&self, keys: &[Self::Key]) -> Result<Vec<Self::Value>> {
+    async fn mget(&self, keys: &[Self::Key]) -> Result<Vec<Entry<Self::Key, Self::Value>>> {
         if keys.is_empty() {
             return Ok(vec![]);
         }
@@ -72,10 +71,10 @@ where
         let mut conn = self.redis_cli.get_multiplexed_async_connection().await?;
 
         if let [key] = keys {
-            let data: Option<Bytes> = conn.get(self.generate_redis_key(key.clone())).await?;
+            let data: Option<Bytes> = conn.get(self.generate_redis_key(key)).await?;
 
             return match data {
-                Some(data) => Ok(vec![V::decode(data)?]),
+                Some(data) => Ok(vec![Entry::<K, V>::decode(data)?]),
                 None => Ok(vec![]),
             };
         }
@@ -83,28 +82,28 @@ where
         let res: Vec<Option<Bytes>> = conn
             .mget(
                 keys.iter()
-                    .map(|k| self.generate_redis_key(k.clone()))
+                    .map(|key| self.generate_redis_key(key))
                     .collect::<Vec<_>>(),
             )
             .await?;
 
         res.into_iter()
             .flatten()
-            .map(|data| V::decode(data).map_err(anyhow::Error::from))
+            .map(|data| Entry::<K, V>::decode(data).map_err(anyhow::Error::from))
             .collect()
     }
 
-    async fn mset(&self, kvs: &[(Self::Key, Self::Value)]) -> Result<()> {
-        if kvs.is_empty() {
+    async fn mset(&self, entries: &[Entry<Self::Key, Self::Value>]) -> Result<()> {
+        if entries.is_empty() {
             return Ok(());
         }
 
-        let encoded_kvs = kvs
+        let encoded_kvs = entries
             .iter()
-            .map(|(key, value)| {
+            .map(|entry| {
                 Ok((
-                    self.generate_redis_key(key.clone()),
-                    value.encode()?.to_vec(),
+                    self.generate_redis_key(&entry.key),
+                    entry.encode()?.to_vec(),
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -145,7 +144,7 @@ where
         let mut conn = self.redis_cli.get_multiplexed_async_connection().await?;
         conn.del::<_, ()>(
             keys.iter()
-                .map(|key| self.generate_redis_key(key.clone()))
+                .map(|key| self.generate_redis_key(key))
                 .collect::<Vec<_>>(),
         )
         .await?;
