@@ -6,7 +6,7 @@ use once_cell::sync::Lazy;
 
 use crate::{autocache::AutoCache, ttl_cache::TtlCache, Cache, Entry};
 
-type TestAutoCache = AutoCache<String, String, TtlCache<String, Entry<String, String>>, ()>;
+type TestAutoCache = AutoCache<String, String, TtlCache<String, Entry<String, String>>>;
 
 static AC: Lazy<ArcSwapOption<TestAutoCache>> = Lazy::new(|| None.into());
 
@@ -19,7 +19,7 @@ async fn test_builder() {
                     .load()
                     .as_ref()
                     .unwrap()
-                    .refresh(&keys.iter().map(|k| (k.0.clone(), ())).collect::<Vec<_>>())
+                    .refresh(&keys.iter().map(|k| k.0.clone()).collect::<Vec<_>>())
                     .await;
             })
             .boxed()
@@ -30,7 +30,7 @@ async fn test_builder() {
         AutoCache::builder()
             .cache(ttl_cache)
             .expire_time(std::time::Duration::from_secs(60))
-            .single_loader(|key: String, ()| async move { Ok(Some(key.clone())) }.boxed())
+            .single_loader(|key: String| async move { Ok(Some(key.clone())) }.boxed())
             .build()
             .unwrap(),
     )));
@@ -39,7 +39,7 @@ async fn test_builder() {
         .load()
         .as_ref()
         .unwrap()
-        .mget(&[(String::from("test-key1"), ())])
+        .mget(&[String::from("test-key1")])
         .await
         .unwrap();
 

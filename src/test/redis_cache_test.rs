@@ -52,7 +52,7 @@ async fn test_redis_cache() {
         .cache(RedisCache::new(redis_cli))
         .expire_time(std::time::Duration::from_secs(10))
         .use_expired_data(true)
-        .single_loader(|key: String, ()| {
+        .single_loader(|key: String| {
             async move {
                 Ok(Some(Item {
                     count: 1,
@@ -67,7 +67,7 @@ async fn test_redis_cache() {
     let key = "autocache:test:redis-cache".to_string();
     ac.mdel(std::slice::from_ref(&key)).await.unwrap();
 
-    let values = ac.mget(&[(key.clone(), ())]).await.unwrap();
+    let values = ac.mget(std::slice::from_ref(&key)).await.unwrap();
 
     assert_eq!(values.len(), 1);
     assert_eq!(values[0].0, key);

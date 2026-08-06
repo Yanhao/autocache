@@ -77,7 +77,7 @@ where
     }
 }
 
-pub struct AutoCache<K, V, C, E>
+pub struct AutoCache<K, V, C, E = ()>
 where
     K: Clone + Eq + Hash,
     V: Clone,
@@ -539,14 +539,19 @@ where
             .collect::<Vec<_>>()
     }
 
-    pub async fn mget(&self, keys: &[(K, E)]) -> Result<Vec<(K, V)>> {
+    pub async fn mget_with_context(&self, keys: &[(K, E)]) -> Result<Vec<(K, V)>> {
         if keys.is_empty() {
             return Ok(vec![]);
         }
-        self.mget_with_option(keys, Options::default()).await
+        self.mget_with_context_and_option(keys, Options::default())
+            .await
     }
 
-    pub async fn mget_with_option(&self, keys: &[(K, E)], options: Options) -> Result<Vec<(K, V)>> {
+    pub async fn mget_with_context_and_option(
+        &self,
+        keys: &[(K, E)],
+        options: Options,
+    ) -> Result<Vec<(K, V)>> {
         let source_first = options.source_first == Some(true)
             || (self.source_first && options.source_first != Some(false));
         if source_first {
@@ -825,7 +830,7 @@ where
         Ok(())
     }
 
-    pub async fn refresh(&self, keys: &[(K, E)]) -> Result<()> {
+    pub async fn refresh_with_context(&self, keys: &[(K, E)]) -> Result<()> {
         self.enqueue_refresh(keys, RefreshEnqueueMode::WaitForCapacity)
             .await
     }
@@ -835,6 +840,51 @@ where
         op: impl FnOnce(Arc<C>) -> BoxFuture<'static, Result<T>> + Send,
     ) -> Result<T> {
         op(self.cache_store.clone()).await
+    }
+}
+
+impl<K, V, C> AutoCache<K, V, C, ()>
+where
+    K: Clone + Debug + Eq + Hash + Sync + Send + 'static,
+    V: Clone + Debug + Sync + Send + 'static,
+    C: Cache<Key = K, Value = Entry<K, V>> + Sync + Send + 'static,
+{
+    /// Returns the value associated with a single key.
+    pub async fn get(&self, key: &K) -> Result<Option<V>> {
+        Ok(self
+            .mget(std::slice::from_ref(key))
+            .await?
+            .into_iter()
+            .find(|(result_key, _)| result_key == key)
+            .map(|(_, value)| value))
+    }
+
+    /// Returns all values found for the requested keys.
+    pub async fn mget(&self, keys: &[K]) -> Result<Vec<(K, V)>> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+        self.mget_with_option(keys, Options::default()).await
+    }
+
+    /// Returns all values found for the requested keys using per-request options.
+    pub async fn mget_with_option(&self, keys: &[K], options: Options) -> Result<Vec<(K, V)>> {
+        let keys = keys
+            .iter()
+            .cloned()
+            .map(|key| (key, ()))
+            .collect::<Vec<_>>();
+        self.mget_with_context_and_option(&keys, options).await
+    }
+
+    /// Queues an explicit refresh for the requested keys.
+    pub async fn refresh(&self, keys: &[K]) -> Result<()> {
+        let keys = keys
+            .iter()
+            .cloned()
+            .map(|key| (key, ()))
+            .collect::<Vec<_>>();
+        self.refresh_with_context(&keys).await
     }
 }
 

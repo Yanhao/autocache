@@ -1,9 +1,9 @@
 use std::fmt::Debug;
+use std::future::Future;
 use std::hash::Hash;
 use std::sync::Arc;
 
 use anyhow::Result;
-use futures::future::BoxFuture;
 
 use crate::{
     autocache::{AutoCache, MetricsCallback},
@@ -17,7 +17,7 @@ use crate::{
 const DEFAULT_MAX_CONCURRENT_ASYNC_CACHE_WRITES: usize = 64;
 const DEFAULT_ASYNC_REFRESH_QUEUE_CAPACITY: usize = 512;
 
-pub struct AutoCacheBuilder<K, V, C, E>
+pub struct AutoCacheBuilder<K, V, C, E = ()>
 where
     K: Clone,
     V: Clone,
@@ -87,7 +87,7 @@ where
         self
     }
 
-    /// Sets a loader for individual cache keys.
+    /// Sets a loader for individual cache keys with per-request context.
     ///
     /// `Ok(None)` is an authoritative not-found result. In source-first mode,
     /// AutoCache will not fall back to a previously cached value for that key.
@@ -95,15 +95,18 @@ where
     ///
     /// For a given `K`, the loader result must not vary based on `E`. Any input
     /// that changes the cached value must be represented in `K` itself.
-    pub fn single_loader(
-        mut self,
-        l: impl Fn(K, E) -> BoxFuture<'static, Result<Option<V>>> + 'static + Send + Sync,
-    ) -> Self {
-        self.loader = Some(Loader::SingleLoader(Box::new(l)));
+    pub fn single_loader_with_context<F, Fut>(mut self, loader: F) -> Self
+    where
+        F: Fn(K, E) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Option<V>>> + Send + 'static,
+    {
+        self.loader = Some(Loader::SingleLoader(Box::new(move |key, context| {
+            Box::pin(loader(key, context))
+        })));
         self
     }
 
-    /// Sets a loader for batches of cache keys.
+    /// Sets a loader for batches of cache keys with per-request context.
     ///
     /// Omitting a requested key from the returned vector is an authoritative
     /// not-found result for that key. In source-first mode, AutoCache will not
@@ -112,11 +115,14 @@ where
     ///
     /// For a given `K`, the loader result must not vary based on `E`. Any input
     /// that changes the cached value must be represented in `K` itself.
-    pub fn multi_loader(
-        mut self,
-        l: impl Fn(Vec<(K, E)>) -> BoxFuture<'static, Result<Vec<(K, V)>>> + 'static + Send + Sync,
-    ) -> Self {
-        self.loader = Some(Loader::MultiLoader(Box::new(l)));
+    pub fn multi_loader_with_context<F, Fut>(mut self, loader: F) -> Self
+    where
+        F: Fn(Vec<(K, E)>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<(K, V)>>> + Send + 'static,
+    {
+        self.loader = Some(Loader::MultiLoader(Box::new(move |keys| {
+            Box::pin(loader(keys))
+        })));
         self
     }
 
@@ -262,5 +268,41 @@ where
         }
 
         Ok(ac)
+    }
+}
+
+impl<K, V, C> AutoCacheBuilder<K, V, C, ()>
+where
+    K: Clone + Debug + Eq + Hash + Sync + Send + 'static,
+    V: Clone + Debug + Sync + Send + 'static,
+    C: Cache<Key = K, Value = Entry<K, V>> + Sync + Send + 'static,
+{
+    /// Sets a loader for individual cache keys.
+    ///
+    /// `Ok(None)` is an authoritative not-found result. In source-first mode,
+    /// AutoCache will not fall back to a previously cached value for that key.
+    /// Use `Err` when the source could not determine whether the key exists.
+    pub fn single_loader<F, Fut>(self, loader: F) -> Self
+    where
+        F: Fn(K) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Option<V>>> + Send + 'static,
+    {
+        self.single_loader_with_context(move |key, ()| loader(key))
+    }
+
+    /// Sets a loader for batches of cache keys.
+    ///
+    /// Omitting a requested key from the returned vector is an authoritative
+    /// not-found result for that key. In source-first mode, AutoCache will not
+    /// fall back to a previously cached value. Return `Err` when the batch
+    /// result is incomplete or otherwise cannot be trusted.
+    pub fn multi_loader<F, Fut>(self, loader: F) -> Self
+    where
+        F: Fn(Vec<K>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<(K, V)>>> + Send + 'static,
+    {
+        self.multi_loader_with_context(move |keys| {
+            loader(keys.into_iter().map(|(key, ())| key).collect())
+        })
     }
 }

@@ -63,7 +63,6 @@ use autocache::{
     local_cache::{LocalCache, LocalCacheOption},
     AutoCache,
 };
-use futures::FutureExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -73,17 +72,14 @@ async fn main() -> anyhow::Result<()> {
             ..Default::default()
         }))
         .expire_time(Duration::from_secs(60))
-        .single_loader(|key: String, (): ()| {
-            async move {
-                // Replace this with a database or service call.
-                Ok(Some(format!("value-for-{key}")))
-            }
-            .boxed()
+        .single_loader(|key: String| async move {
+            // Replace this with a database or service call.
+            Ok(Some(format!("value-for-{key}")))
         })
         .build()?;
 
     let values = cache
-        .mget(&[("user:42".to_string(), ())])
+        .mget(&["user:42".to_string()])
         .await?;
 
     assert_eq!(
@@ -94,10 +90,57 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-Each request is `(K, E)`:
+The common API accepts keys directly. `K` is the cache and singleflight
+identity:
 
-- `K` is the cache and singleflight identity.
-- `E` is extra input passed to the loader but is not part of the identity.
+```rust,no_run
+# use autocache::{AutoCache, local_cache::{LocalCache, LocalCacheOption}};
+# async fn example() -> anyhow::Result<()> {
+# let cache = AutoCache::builder()
+#     .cache(LocalCache::new(LocalCacheOption::default()))
+#     .single_loader(|key: String| async move { Ok(Some(key)) })
+#     .build()?;
+let value = cache.get(&"user:42".to_string()).await?;
+let values = cache
+    .mget(&["user:42".to_string(), "user:43".to_string()])
+    .await?;
+# let _ = (value, values);
+# Ok(())
+# }
+```
+
+If a loader needs per-request context, use the explicit context API:
+
+```rust,no_run
+# use autocache::{AutoCache, local_cache::{LocalCache, LocalCacheOption}};
+#[derive(Clone, Debug)]
+struct RequestContext {
+    trace_id: String,
+}
+
+# async fn example() -> anyhow::Result<()> {
+let cache = AutoCache::builder()
+    .cache(LocalCache::new(LocalCacheOption::default()))
+    .single_loader_with_context(|key: String, context: RequestContext| async move {
+        let _trace_id = context.trace_id;
+        Ok(Some(format!("value-for-{key}")))
+    })
+    .build()?;
+
+let values = cache
+    .mget_with_context(&[(
+        "user:42".to_string(),
+        RequestContext {
+            trace_id: "request-123".to_string(),
+        },
+    )])
+    .await?;
+# let _ = values;
+# Ok(())
+# }
+```
+
+Here `E` is extra input passed to the loader but is not part of the identity.
 
 For a given `K`, the loader result must not vary based on `E`. Put tenant IDs,
 versions, locales, or any other value-affecting input in `K` itself.
@@ -123,12 +166,11 @@ Use source-first when freshness is more important than avoiding source calls:
 
 ```rust,no_run
 # use autocache::{AutoCache, local_cache::{LocalCache, LocalCacheOption}};
-# use futures::FutureExt;
 let cache = AutoCache::builder()
     .cache(LocalCache::new(LocalCacheOption::default()))
     .source_first(true)
-    .single_loader(|key: String, (): ()| {
-        async move { Ok(Some(key)) }.boxed()
+    .single_loader(|key: String| {
+        async move { Ok(Some(key)) }
     })
     .build()?;
 # Ok::<(), anyhow::Error>(())
@@ -152,14 +194,13 @@ Enable negative caching when repeated misses are expensive:
 
 ```rust,no_run
 # use autocache::{AutoCache, local_cache::{LocalCache, LocalCacheOption}};
-# use futures::FutureExt;
 # use std::time::Duration;
 let cache = AutoCache::builder()
     .cache(LocalCache::new(LocalCacheOption::default()))
     .cache_none(true)
     .none_value_expire_time(Duration::from_secs(15))
-    .single_loader(|_key: String, (): ()| {
-        async move { Ok(None::<String>) }.boxed()
+    .single_loader(|_key: String| {
+        async move { Ok(None::<String>) }
     })
     .build()?;
 # Ok::<(), anyhow::Error>(())
@@ -175,13 +216,12 @@ Enable stale-while-revalidate behavior with `use_expired_data(true)`:
 
 ```rust,no_run
 # use autocache::{AutoCache, local_cache::{LocalCache, LocalCacheOption}};
-# use futures::FutureExt;
 let cache = AutoCache::builder()
     .cache(LocalCache::new(LocalCacheOption::default()))
     .use_expired_data(true)
     .async_refresh_queue_capacity(256)
-    .single_loader(|key: String, (): ()| {
-        async move { Ok(Some(key)) }.boxed()
+    .single_loader(|key: String| {
+        async move { Ok(Some(key)) }
     })
     .build()?;
 # Ok::<(), anyhow::Error>(())
@@ -208,13 +248,12 @@ fill never replaces the successful source result. To detach them from the read:
 
 ```rust,no_run
 # use autocache::{AutoCache, local_cache::{LocalCache, LocalCacheOption}};
-# use futures::FutureExt;
 let cache = AutoCache::builder()
     .cache(LocalCache::new(LocalCacheOption::default()))
     .async_set_cache(true)
     .max_concurrent_async_cache_writes(64)
-    .single_loader(|key: String, (): ()| {
-        async move { Ok(Some(key)) }.boxed()
+    .single_loader(|key: String| {
+        async move { Ok(Some(key)) }
     })
     .build()?;
 # Ok::<(), anyhow::Error>(())
@@ -231,21 +270,19 @@ Use a multi-loader to fetch source values in batches:
 
 ```rust,no_run
 # use autocache::{AutoCache, local_cache::{LocalCache, LocalCacheOption}};
-# use futures::FutureExt;
 let cache = AutoCache::builder()
     .cache(LocalCache::new(LocalCacheOption::default()))
     .max_batch_size(100)
-    .multi_loader(|keys: Vec<(String, ())>| {
+    .multi_loader(|keys: Vec<String>| {
         async move {
             Ok(keys
                 .into_iter()
-                .map(|(key, ())| {
+                .map(|key| {
                     let value = format!("value-for-{key}");
                     (key, value)
                 })
                 .collect())
         }
-        .boxed()
     })
     .build()?;
 # Ok::<(), anyhow::Error>(())
@@ -260,16 +297,15 @@ Builder settings can be overridden for an individual read:
 
 ```rust,no_run
 # use autocache::{AutoCache, Options, local_cache::{LocalCache, LocalCacheOption}};
-# use futures::FutureExt;
 # use std::time::Duration;
 # async fn example() -> anyhow::Result<()> {
 # let cache = AutoCache::builder()
 #     .cache(LocalCache::new(LocalCacheOption::default()))
-#     .single_loader(|key: String, (): ()| async move { Ok(Some(key)) }.boxed())
+#     .single_loader(|key: String| async move { Ok(Some(key)) })
 #     .build()?;
 let values = cache
     .mget_with_option(
-        &[("user:42".to_string(), ())],
+        &["user:42".to_string()],
         Options {
             source_first: Some(true),
             expire_time: Some(Duration::from_secs(30)),
@@ -308,7 +344,6 @@ implementation uses JSON:
 use std::time::Duration;
 
 use autocache::{redis_cache::RedisCache, AutoCache, Codec};
-use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -324,13 +359,12 @@ let cache = AutoCache::builder()
     .cache(RedisCache::new(client))
     .namespace("my-service".to_string())
     .expire_time(Duration::from_secs(60))
-    .single_loader(|key: String, (): ()| {
+    .single_loader(|key: String| {
         async move {
             Ok(Some(User {
                 name: format!("user-{key}"),
             }))
         }
-        .boxed()
     })
     .build()?;
 # let _ = cache;
@@ -395,12 +429,11 @@ fn record_metric(method: &str, is_error: bool, ns: &str, from: &str, cache: &str
 }
 
 # use autocache::{AutoCache, local_cache::{LocalCache, LocalCacheOption}};
-# use futures::FutureExt;
 let cache = AutoCache::builder()
     .cache(LocalCache::new(LocalCacheOption::default()))
     .on_metrics(record_metric)
-    .single_loader(|key: String, (): ()| {
-        async move { Ok(Some(key)) }.boxed()
+    .single_loader(|key: String| {
+        async move { Ok(Some(key)) }
     })
     .build()?;
 # Ok::<(), anyhow::Error>(())

@@ -235,12 +235,12 @@ async fn test_mdel_invalidates_l1_when_l2_fails() {
 async fn test_single_loader_returns_source_value_when_cache_fill_fails() {
     let ac = AutoCache::builder()
         .cache(unavailable_two_level_cache())
-        .single_loader(|key: String, ()| async move { Ok(Some(format!("source:{key}"))) }.boxed())
+        .single_loader(|key: String| async move { Ok(Some(format!("source:{key}"))) }.boxed())
         .build()
         .unwrap();
 
     let key = "test-key".to_string();
-    let result = ac.mget(&[(key.clone(), ())]).await.unwrap();
+    let result = ac.mget(std::slice::from_ref(&key)).await.unwrap();
 
     assert_eq!(result, vec![(key, "source:test-key".to_string())]);
 }
@@ -249,11 +249,11 @@ async fn test_single_loader_returns_source_value_when_cache_fill_fails() {
 async fn test_multi_loader_returns_source_values_when_cache_fill_fails() {
     let ac = AutoCache::builder()
         .cache(unavailable_two_level_cache())
-        .multi_loader(|keys: Vec<(String, ())>| {
+        .multi_loader(|keys: Vec<String>| {
             async move {
                 Ok(keys
                     .into_iter()
-                    .map(|(key, ())| {
+                    .map(|key| {
                         let value = format!("source:{key}");
                         (key, value)
                     })
@@ -264,7 +264,7 @@ async fn test_multi_loader_returns_source_values_when_cache_fill_fails() {
         .build()
         .unwrap();
 
-    let keys = vec![("key-1".to_string(), ()), ("key-2".to_string(), ())];
+    let keys = vec!["key-1".to_string(), "key-2".to_string()];
     let result = ac.mget(&keys).await.unwrap();
 
     assert_eq!(
@@ -289,11 +289,11 @@ async fn test_not_found_returns_success_when_cache_invalidation_fails() {
     let ac = AutoCache::builder()
         .cache(TwoLevelCache::new(l1, TestCache::default()))
         .source_first(true)
-        .single_loader(|_key: String, ()| async move { Ok(None::<String>) }.boxed())
+        .single_loader(|_key: String| async move { Ok(None::<String>) }.boxed())
         .build()
         .unwrap();
 
-    let result = ac.mget(&[(key.clone(), ())]).await.unwrap();
+    let result = ac.mget(std::slice::from_ref(&key)).await.unwrap();
 
     assert!(result.is_empty());
     assert!(l1_observer.data.lock().contains_key(&key));
@@ -303,7 +303,7 @@ async fn test_not_found_returns_success_when_cache_invalidation_fails() {
 async fn test_explicit_mset_still_propagates_cache_write_errors() {
     let ac = AutoCache::builder()
         .cache(unavailable_two_level_cache())
-        .single_loader(|key: String, ()| async move { Ok(Some(key)) }.boxed())
+        .single_loader(|key: String| async move { Ok(Some(key)) }.boxed())
         .build()
         .unwrap();
 
@@ -355,7 +355,7 @@ mod redis_integration {
             ))
             .expire_time(std::time::Duration::from_secs(10))
             .use_expired_data(true)
-            .single_loader(|key: String, ()| {
+            .single_loader(|key: String| {
                 async move {
                     Ok(Some(Item {
                         count: 1,
@@ -370,7 +370,7 @@ mod redis_integration {
         let key = "autocache:test:two-level-cache".to_string();
         ac.mdel(std::slice::from_ref(&key)).await.unwrap();
 
-        let values = ac.mget(&[(key.clone(), ())]).await.unwrap();
+        let values = ac.mget(std::slice::from_ref(&key)).await.unwrap();
 
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].0, key);
